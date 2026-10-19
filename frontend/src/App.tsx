@@ -15,18 +15,10 @@ import ErrorBoundary from './components/common/ErrorBoundary'
 import RouteLoader from './components/common/RouteLoader'
 import { ProtectedRoute } from './components/auth/ProtectedRoute'
 import { CommandPalette } from './components/common/CommandPalette'
+import { MotionProvider } from './components/common/MotionProvider'
 import { useCommandPalette } from './hooks/useCommandPalette'
 import './components/common/Toast.css'
 
-const RouteLoadingFallback: React.FC = () => (
-  <div className="p-8 text-center text-text-muted">Loading...</div>
-)
-
-const DashboardPage = lazy(() => import('./pages/DashboardPage'))
-const WalletPage = lazy(() => import('./pages/WalletPage'))
-const AgentsPage = lazy(() => import('./pages/AgentsPage'))
-const NewTaskPage = lazy(() => import('./pages/NewTaskPage'))
-const TaskHistoryPage = lazy(() => import('./pages/TaskHistoryPage'))
 // Route-level code splitting: every page except LandingPage (kept eager so
 // the first paint on `/` is not delayed) is fetched on demand. Heavy
 // route-only libraries (reactflow, recharts, jspdf, react-syntax-highlighter)
@@ -127,20 +119,22 @@ const App: React.FC = () => {
   return (
     <I18nextProvider i18n={i18n}>
       <ErrorBoundary>
-        <ThemeProvider>
-          <WalletProvider>
-            <ToastProvider>
-              <NotificationProvider>
-                <RouteProgressProvider>
-                  <Router>
-                    <RouteProgressBar />
-                    <RoutedContent />
-                  </Router>
-                </RouteProgressProvider>
-              </NotificationProvider>
-            </ToastProvider>
-          </WalletProvider>
-        </ThemeProvider>
+        <MotionProvider>
+          <ThemeProvider>
+            <WalletProvider>
+              <ToastProvider>
+                <NotificationProvider>
+                  <RouteProgressProvider>
+                    <Router>
+                      <RouteProgressBar />
+                      <RoutedContent />
+                    </Router>
+                  </RouteProgressProvider>
+                </NotificationProvider>
+              </ToastProvider>
+            </WalletProvider>
+          </ThemeProvider>
+        </MotionProvider>
       </ErrorBoundary>
     </I18nextProvider>
   )

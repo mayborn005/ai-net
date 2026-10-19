@@ -109,7 +109,11 @@ fn parse_version(bytes: &[u8]) -> Option<ParsedVersion<'_>> {
         None => (bytes, None),
     };
     if let Some(build) = build {
-        if build.is_empty() || !build.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-') {
+        if build.is_empty()
+            || !build
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-')
+        {
             return None;
         }
     }
@@ -124,7 +128,11 @@ fn parse_version(bytes: &[u8]) -> Option<ParsedVersion<'_>> {
             return None;
         }
         for ident in pre.split(|&b| b == b'.') {
-            if ident.is_empty() || !ident.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+            if ident.is_empty()
+                || !ident
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            {
                 return None;
             }
         }
@@ -188,7 +196,11 @@ fn compare_pre_release(a: &[u8], b: &[u8]) -> Ordering {
 pub fn compare_version_bytes(a: &[u8], b: &[u8]) -> Option<Ordering> {
     let va = parse_version(a)?;
     let vb = parse_version(b)?;
-    let n = if va.count > vb.count { va.count } else { vb.count };
+    let n = if va.count > vb.count {
+        va.count
+    } else {
+        vb.count
+    };
     for i in 0..n {
         let ord = va.parts[i].cmp(&vb.parts[i]);
         if ord != Ordering::Equal {

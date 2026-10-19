@@ -56,13 +56,23 @@ interface Window {
  *  - `X-RateLimit-Reset`     — Unix timestamp (seconds) when the window resets
  *
  * On 429 responses `Retry-After` is also set (seconds until reset).
+ *
+ * Several limiters can apply to one request (the app-wide limiter plus a
+ * route-group limiter). Unless `force` is set, headers already written by an
+ * earlier limiter are kept when they advertise fewer remaining requests, so
+ * clients always see the most restrictive budget that applies to them.
  */
 function setRateLimitHeaders(
   res: Response,
   limit: number,
   remaining: number,
   resetAtMs: number,
+  force = false,
 ): void {
+  const existing = Number(res.getHeader("X-RateLimit-Remaining"));
+  if (!force && Number.isFinite(existing) && existing < Math.max(0, remaining)) {
+    return;
+  }
   const resetSec = Math.ceil(resetAtMs / 1000);
   res.setHeader("X-RateLimit-Limit", String(limit));
   res.setHeader("X-RateLimit-Remaining", String(Math.max(0, remaining)));
@@ -96,7 +106,7 @@ export function createRateLimiter(opts: RateLimitOptions = {}): RateLimiter {
     const now = Date.now();
     const cutoff = now - windowMs;
 
-    let win = windows.get(ip) ?? { timestamps: [] };
+    const win = windows.get(ip) ?? { timestamps: [] };
     win.timestamps = win.timestamps.filter((t) => t > cutoff);
 
     const oldest = win.timestamps[0];
@@ -105,7 +115,7 @@ export function createRateLimiter(opts: RateLimitOptions = {}): RateLimiter {
 
     if (win.timestamps.length >= maxRequests) {
       const retryAfter = Math.ceil((resetAtMs - now) / 1000);
-      setRateLimitHeaders(res, maxRequests, 0, resetAtMs);
+      setRateLimitHeaders(res, maxRequests, 0, resetAtMs, true);
       res.setHeader("Retry-After", String(retryAfter));
       res
         .status(429)
@@ -140,7 +150,7 @@ export class RedisRateLimiter {
 
   constructor(redisUrl: string) {
     // Lazy-require ioredis so the module doesn't break when Redis is not used
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const Redis = require("ioredis");
     this.client = new Redis(redisUrl);
     this.fallback = createRateLimiter({ maxRequests: 5, windowMs: 60_000 });
@@ -256,42 +266,31 @@ export function getRateLimiter(): RedisRateLimiter {
 //
 // Limits are intentionally conservative; operators should tune via env.
 
-function readEnvInt(key: string, fallback: number): number {
-  const raw = process.env[key];
-  if (!raw) return fallback;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
-function readEnvWindowMs(key: string, fallback: number): number {
-  const raw = process.env[key];
-  if (!raw) return fallback;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
 /**
- * Lazily-created group limiters.  Using factory functions so tests can reset
- * process.env before the limiter is instantiated.
+ * Lazily-created group limiters. Using factory functions so tests can reset
+ * config before the limiter is instantiated.
  */
 export function createPublicLimiter(): RateLimiter {
+  const cfg = getConfig();
   return createRateLimiter({
-    windowMs: readEnvWindowMs("RATE_LIMIT_PUBLIC_WINDOW_MS", 60_000),
-    maxRequests: readEnvInt("RATE_LIMIT_PUBLIC_MAX_REQUESTS", 120),
+    windowMs: cfg.RATE_LIMIT_PUBLIC_WINDOW_MS,
+    maxRequests: cfg.RATE_LIMIT_PUBLIC_MAX_REQUESTS,
   });
 }
 
 export function createAuthedLimiter(): RateLimiter {
+  const cfg = getConfig();
   return createRateLimiter({
-    windowMs: readEnvWindowMs("RATE_LIMIT_AUTHED_WINDOW_MS", 60_000),
-    maxRequests: readEnvInt("RATE_LIMIT_AUTHED_MAX_REQUESTS", 30),
+    windowMs: cfg.RATE_LIMIT_AUTHED_WINDOW_MS,
+    maxRequests: cfg.RATE_LIMIT_AUTHED_MAX_REQUESTS,
   });
 }
 
 export function createAdminLimiter(): RateLimiter {
+  const cfg = getConfig();
   return createRateLimiter({
-    windowMs: readEnvWindowMs("RATE_LIMIT_ADMIN_WINDOW_MS", 60_000),
-    maxRequests: readEnvInt("RATE_LIMIT_ADMIN_MAX_REQUESTS", 20),
+    windowMs: cfg.RATE_LIMIT_ADMIN_WINDOW_MS,
+    maxRequests: cfg.RATE_LIMIT_ADMIN_MAX_REQUESTS,
   });
 }
 
@@ -422,14 +421,12 @@ export function agentAuthFailureGuard(req: Request, res: Response, next: NextFun
   }
 
   const ip = req.ip ?? "unknown";
-  const windowMs = readEnvWindowMs(
-    "AGENT_AUTH_FAILURE_LIMIT_WINDOW_MS",
-    getConfig().AGENT_AUTH_FAILURE_LIMIT_WINDOW_MS,
-  );
-  const maxFailures = readEnvInt(
-    "AGENT_AUTH_FAILURE_LIMIT_MAX",
-    getConfig().AGENT_AUTH_FAILURE_LIMIT_MAX,
-  );
+  // Both limits are part of the validated config, which is itself built from
+  // the environment (AGENT_AUTH_FAILURE_LIMIT_*), so there is no raw env read
+  // to do here.
+  const config = getConfig();
+  const windowMs = config.AGENT_AUTH_FAILURE_LIMIT_WINDOW_MS;
+  const maxFailures = config.AGENT_AUTH_FAILURE_LIMIT_MAX;
 
   const cutoff = Date.now() - windowMs;
   const timestamps = (failureWindows.get(ip)?.timestamps ?? []).filter((t) => t > cutoff);
@@ -440,7 +437,11 @@ export function agentAuthFailureGuard(req: Request, res: Response, next: NextFun
     return;
   }
 
-  const retryAfter = Math.ceil(windowMs / 1000);
+  // The budget frees up as soon as the oldest recorded failure ages out.
+  const now = Date.now();
+  const resetAtMs = (timestamps[0] ?? now) + windowMs;
+  const retryAfter = Math.max(1, Math.ceil((resetAtMs - now) / 1000));
+  setRateLimitHeaders(res, maxFailures, 0, resetAtMs, true);
   res.setHeader("Retry-After", String(retryAfter));
   res.status(429).json({
     error: {

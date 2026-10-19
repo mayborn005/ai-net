@@ -20,6 +20,12 @@ export interface UseTaskWebSocketOptions {
    * client cannot prove ownership and the server closes the socket.
    */
   signChallenge?: (nonce: string) => string | Promise<string>;
+  /**
+   * When true, no socket is opened until `walletPublicKey` is present;
+   * the hook reports `authentication-required` instead. Used by
+   * `useTaskMonitor` for wallet-gated task streams.
+   */
+  requireAuthentication?: boolean;
   /** Base host for the stream. Defaults to localhost:3001 (matching the server). */
   baseUrl?: string;
   /** Maximum automatic reconnect attempts before giving up. Default 5. */
@@ -82,6 +88,7 @@ export const useTaskWebSocket = (options: UseTaskWebSocketOptions) => {
     onDisconnect,
     walletPublicKey,
     signChallenge,
+    requireAuthentication,
     baseUrl = DEFAULT_BASE_URL,
     maxReconnectAttempts = 5,
     maxJitterMs = 0,

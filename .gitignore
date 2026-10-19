@@ -22,3 +22,5 @@ smart-contracts/testnet-farm-output/
 # Property test snapshots (auto-generated, large fixtures)
 **/test_snapshots/property_tests/
 
+# Generated Wasm size report (baseline lives in smart-contracts/wasm-sizes.json)
+smart-contracts/wasm-size-report.md

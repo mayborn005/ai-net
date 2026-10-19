@@ -72,6 +72,12 @@ The `frontend-visual-regression` job in `.github/workflows/ci.yml`:
 1. Runs inside the pinned `mcr.microsoft.com/playwright` image so its rendering matches the flow above.
 2. Runs `npm run test:visual`.
 3. Uploads the HTML report (`frontend/playwright-report-visual/`) as the `playwright-visual-report` build artifact on every run (pass or fail) — open its `index.html` to see the expected/actual/diff image for every snapshot, including passing ones.
-4. On failure, writes a pointer to that artifact into the job's step summary.
+4. On failure, additionally uploads raw `frontend/test-results/` (`*-actual.png`, `*-diff.png`, `*-expected.png`, `trace.zip`) as the `playwright-visual-diffs` artifact, and writes pointers to both artifacts into the job's step summary.
+
+## Baseline review policy
+
+- **Update baselines** (`npm run test:visual:update`) only for intentional UI changes: restyling, spacing/colour/typography, added/removed/reordered sections, copy changes, theme-token changes. Say so in the PR description and keep the before/after images reviewable.
+- **Do not update** when the diff signals a bug (layout shift, hidden element, contrast drop) — fix the code instead. Re-recording over a regression deletes the only signal.
+- If ambiguous, open the report and compare `actual` vs `expected` by eye: one-pixel text shift is noise; a moved card or recoloured button is not.
 
 The job is `continue-on-error: true`: a visual diff is reported and visible on the PR's checks list and via the artifact, but does not block merging on its own. Treat a red run as a prompt to open the report and confirm whether the diff is an intentional UI change (update baselines) or a regression (fix the code).

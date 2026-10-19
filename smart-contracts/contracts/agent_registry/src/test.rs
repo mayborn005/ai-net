@@ -1723,6 +1723,61 @@ fn record_task_completion_success() {
 }
 
 #[test]
+fn authorized_task_outcome_updates_reputation_once_and_emits_event() {
+    let (env, client, admin) = setup_with_admin();
+    let reporter = Address::generate(&env);
+    let agent_id = Symbol::new(&env, "outcome_agent");
+    client.register_agent(&make_record(
+        &env,
+        "outcome_agent",
+        "coding",
+        Address::generate(&env),
+    ));
+    client.add_authorized_caller(&reporter);
+    let task_id = Symbol::new(&env, "task_once");
+    let previous_events = env.events().all().len();
+
+    client.record_task_outcome(&reporter, &agent_id, &true, &25_000i32, &task_id);
+    let rep = client.get_reputation(&agent_id).unwrap();
+    assert_eq!(rep.score, 25_000);
+    assert!(env.events().all().len() > previous_events);
+    client.record_task_outcome(
+        &reporter,
+        &agent_id,
+        &false,
+        &-10_000i32,
+        &Symbol::new(&env, "task_failure"),
+    );
+    assert_eq!(
+        client.get_reputation(&agent_id).unwrap().score,
+        rep.score - 10_000
+    );
+    assert!(client
+        .try_record_task_outcome(&reporter, &agent_id, &false, &-10_000i32, &task_id)
+        .is_err());
+    assert_eq!(client.get_reputation(&agent_id).unwrap().score, rep.score);
+    assert_eq!(client.is_authorized_caller(&reporter), true);
+    client.remove_authorized_caller(&reporter);
+    assert_eq!(client.is_authorized_caller(&reporter), false);
+    let _ = admin;
+}
+
+#[test]
+fn task_outcome_rejects_unlisted_reporter() {
+    let (env, client, _) = setup_with_admin();
+    let reporter = Address::generate(&env);
+    assert!(client
+        .try_record_task_outcome(
+            &reporter,
+            &Symbol::new(&env, "agent"),
+            &true,
+            &1i32,
+            &Symbol::new(&env, "task")
+        )
+        .is_err());
+}
+
+#[test]
 fn record_task_completion_failure() {
     let (env, client) = setup();
     let agent_id = Symbol::new(&env, "agent1");
@@ -3009,7 +3064,11 @@ fn version_lookup_versioned_constraint_filters_older_agents() {
     client.register_agent_version(&r2, &String::from_str(&env, "2.0.0"));
 
     // Ask for agents with version >= 2.0.0 — only r2 should match.
-    let constraint = Some(AgentVersion { major: 2, minor: 0, patch: 0 });
+    let constraint = Some(AgentVersion {
+        major: 2,
+        minor: 0,
+        patch: 0,
+    });
     let results = client.lookup_agents_versioned(&Symbol::new(&env, "research"), &constraint);
     assert_eq!(results.len(), 1);
     assert_eq!(results.get(0).unwrap().id, r2.id);
@@ -3042,7 +3101,12 @@ fn version_events_emitted_on_publish_and_supersede() {
         }
     }
 
-    assert!(pub_count >= 2, "expected >=2 ver_pub events, got {pub_count}");
-    assert!(sup_count >= 1, "expected >=1 ver_sup event, got {sup_count}");
+    assert!(
+        pub_count >= 2,
+        "expected >=2 ver_pub events, got {pub_count}"
+    );
+    assert!(
+        sup_count >= 1,
+        "expected >=1 ver_sup event, got {sup_count}"
+    );
 }
-

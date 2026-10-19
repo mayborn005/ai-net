@@ -30,5 +30,5 @@ export const useNetworkStats = () => {
     return () => window.removeEventListener('focus', onFocus);
   }, [fetch]);
 
-  return { data, loading, error };
+  return { data, loading, error, retry: fetch };
 };

@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckCircle, XCircle, AlertTriangle, Info } from 'lucide-react';
 import './Toast.css';

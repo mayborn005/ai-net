@@ -138,7 +138,7 @@ docker compose up -d
 
 # 3. Access interfaces:
 # - Frontend: http://localhost:5173
-# - Backend API: http://localhost:3000 (Health: http://localhost:3000/health)
+# - Backend API: http://localhost:3000 (Liveness: /health/live, dependencies: /health/deep)
 # - API docs (Swagger UI): http://localhost:3000/api-docs
 # - Stellar Standalone RPC: http://localhost:8000/soroban/rpc
 ```

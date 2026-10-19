@@ -4,6 +4,8 @@ import {
   CircuitBreakerEvent,
   getCircuitBreaker,
   getAllCircuitBreakerStatuses,
+  trackCircuitBreaker,
+  summarizeCircuitBreakers,
   _resetCircuitBreakerRegistry,
 } from './circuitBreaker';
 
@@ -236,6 +238,74 @@ describe('Circuit breaker registry', () => {
     getCircuitBreaker({ name: 'horizon' });
     const statuses = getAllCircuitBreakerStatuses();
     expect(statuses.map((s: { name: string }) => s.name)).toEqual(expect.arrayContaining(['venice', 'horizon']));
+  });
+});
+
+// ── Success/failure timestamps ────────────────────────────────────────────────
+
+describe('CircuitBreaker — last success/failure timestamps', () => {
+  it('starts with no recorded success or failure', () => {
+    const { breaker } = makeBreaker({});
+    expect(breaker.getStatus().lastSuccessAt).toBeNull();
+    expect(breaker.getStatus().lastFailureAt).toBeNull();
+  });
+
+  it('records the time of the latest success and failure', () => {
+    const { breaker, advanceTime } = makeBreaker({ now: 1_000 });
+    breaker.recordSuccess();
+    advanceTime(500);
+    breaker.recordFailure();
+    const status = breaker.getStatus();
+    expect(status.lastSuccessAt).toBe(1_000);
+    expect(status.lastFailureAt).toBe(1_500);
+  });
+});
+
+// ── Tracked breakers / summaries ──────────────────────────────────────────────
+
+describe('summarizeCircuitBreakers', () => {
+  beforeEach(() => _resetCircuitBreakerRegistry());
+
+  it('returns null when no breaker has that name', () => {
+    expect(summarizeCircuitBreakers('venice')).toBeNull();
+  });
+
+  it('aggregates tracked instances: worst state, max failures, latest timestamps', () => {
+    let now = 1_000;
+    const nowFn = () => now;
+    const healthy = new CircuitBreaker({ name: 'venice', failureThreshold: 1, nowFn });
+    const broken = new CircuitBreaker({ name: 'venice', failureThreshold: 1, nowFn });
+    trackCircuitBreaker(healthy);
+    trackCircuitBreaker(broken);
+
+    broken.recordFailure();
+    now = 2_000;
+    healthy.recordSuccess();
+
+    const summary = summarizeCircuitBreakers('venice');
+    expect(summary).toMatchObject({
+      name: 'venice',
+      state: 'OPEN',
+      instances: 2,
+      openInstances: 1,
+      failures: 1,
+      lastSuccessAt: 2_000,
+      lastFailureAt: 1_000,
+    });
+  });
+
+  it('includes the registry breaker of the same name', () => {
+    const registered = getCircuitBreaker({ name: 'stellar-horizon', failureThreshold: 1 });
+    registered.recordFailure();
+    expect(summarizeCircuitBreakers('stellar-horizon')?.state).toBe('OPEN');
+  });
+
+  it('stops reporting a breaker once untracked', () => {
+    const breaker = new CircuitBreaker({ name: 'venice' });
+    const untrack = trackCircuitBreaker(breaker);
+    expect(summarizeCircuitBreakers('venice')?.instances).toBe(1);
+    untrack();
+    expect(summarizeCircuitBreakers('venice')).toBeNull();
   });
 });
 

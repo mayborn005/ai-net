@@ -9,8 +9,14 @@ import { KpiCard } from '../components/dashboard/KpiCard';
 import { NetworkHealthBadge } from '../components/dashboard/NetworkHealthBadge';
 import { RecentTasksTable } from '../components/dashboard/RecentTasksTable';
 import { AgentWatchdogPanel } from '../components/dashboard/AgentWatchdogPanel';
+import { DashboardPanel } from '../components/dashboard/DashboardPanel';
 import { useToast } from '../hooks/useToast';
-import { Skeleton, SkeletonAvatar, SkeletonCard, SkeletonTable } from '../components/common/Skeleton';
+import {
+  Skeleton,
+  SkeletonAvatar,
+  SkeletonCard,
+  SkeletonTable,
+} from '../components/common/Skeleton';
 import styles from './dashboard.module.css';
 import type { TimePoint, NetworkStats } from '../types/api';
 
@@ -28,7 +34,6 @@ const formatCostUsd = (value: number): string => {
   if (value < 0.01) return `$${value.toFixed(4)}`;
   return `$${value.toFixed(2)}`;
 };
-
 
 /**
  * Context-aware skeleton that mirrors the dashboard layout so there is no
@@ -62,7 +67,7 @@ export const DashboardSkeleton: React.FC = () => {
 
 export const DashboardPage: React.FC = () => {
   const { address, connected } = useWallet();
-  const { data, loading, error } = useNetworkStats();
+  const { data, loading, error, retry } = useNetworkStats();
   const { showToast } = useToast();
   const { t, i18n } = useTranslation();
 
@@ -70,7 +75,10 @@ export const DashboardPage: React.FC = () => {
     if (error) {
       // i18n.t so the toast uses the current language without re-running the
       // effect on every language change.
-      showToast(i18n.t('page.dashboard.statsError', { error: error.message || String(error) }), 'error');
+      showToast(
+        i18n.t('page.dashboard.statsError', { error: error.message || String(error) }),
+        'error'
+      );
     }
   }, [error, showToast, i18n]);
 
@@ -80,14 +88,6 @@ export const DashboardPage: React.FC = () => {
   }
 
   if (!address) return null; // render nothing while redirecting
-  if (loading) {
-    return (
-      <DashboardLayout>
-        <DashboardSkeleton />
-      </DashboardLayout>
-    );
-  }
-
   const kpiData: NetworkStats = data || {
     totalAgents: 0,
     totalTasks: 0,
@@ -107,27 +107,55 @@ export const DashboardPage: React.FC = () => {
 
   return (
     <DashboardLayout className="fade-in">
-      <section className={styles.kpis}>
-        <KpiCard title={t('page.dashboard.totalAgents')} value={kpiData.totalAgents} loading={loading} />
-        <KpiCard title={t('page.dashboard.totalTasks')} value={kpiData.totalTasks} sparklineData={tasksSeries} loading={loading} />
-        <KpiCard title={t('page.dashboard.totalXLM')} value={kpiData.totalXLMTransacted} sparklineData={xlmSeries} loading={loading} />
-        <KpiCard title={t('page.dashboard.uptime')} value={`${kpiData.uptimePercent.toFixed(2)}%`} loading={loading} />
-        {/* Platform LLM spend (Issue #390). Renders as a string, so KpiCard shows
+      <DashboardPanel
+        loading={loading}
+        error={error}
+        onRetry={() => void retry()}
+        empty={!data}
+        emptyTitle={t('page.dashboard.emptyTitle')}
+        emptyDescription={t('page.dashboard.emptyDescription')}
+        loadingContent={<DashboardSkeleton />}
+      >
+        <section className={styles.kpis}>
+          <KpiCard
+            title={t('page.dashboard.totalAgents')}
+            value={kpiData.totalAgents}
+            loading={loading}
+          />
+          <KpiCard
+            title={t('page.dashboard.totalTasks')}
+            value={kpiData.totalTasks}
+            sparklineData={tasksSeries}
+            loading={loading}
+          />
+          <KpiCard
+            title={t('page.dashboard.totalXLM')}
+            value={kpiData.totalXLMTransacted}
+            sparklineData={xlmSeries}
+            loading={loading}
+          />
+          <KpiCard
+            title={t('page.dashboard.uptime')}
+            value={`${kpiData.uptimePercent.toFixed(2)}%`}
+            loading={loading}
+          />
+          {/* Platform LLM spend (Issue #390). Renders as a string, so KpiCard shows
             it verbatim rather than count-animating a dollar figure. */}
-        <KpiCard
-          title={t('page.dashboard.totalCost', { defaultValue: 'LLM spend' })}
-          value={formatCostUsd(kpiData.cost?.costUsd ?? 0)}
-          sparklineData={costSeries}
-          loading={loading}
-        />
-      </section>
-      <section className={styles.health}>
-        <NetworkHealthBadge uptimePercent={kpiData.uptimePercent} />
-      </section>
-      <section className={styles.recentTasks}>
-        <h2 className={styles.heading}>{t('page.dashboard.recentTasks')}</h2>
-        <RecentTasksTable walletAddress={address ?? ''} loading={loading} />
-      </section>
+          <KpiCard
+            title={t('page.dashboard.totalCost', { defaultValue: 'LLM spend' })}
+            value={formatCostUsd(kpiData.cost?.costUsd ?? 0)}
+            sparklineData={costSeries}
+            loading={loading}
+          />
+        </section>
+        <section className={styles.health}>
+          <NetworkHealthBadge uptimePercent={kpiData.uptimePercent} />
+        </section>
+        <section className={styles.recentTasks}>
+          <h2 className={styles.heading}>{t('page.dashboard.recentTasks')}</h2>
+          <RecentTasksTable walletAddress={address ?? ''} loading={loading} />
+        </section>
+      </DashboardPanel>
       {/* Agent heartbeat health (Issue #379) */}
       <AgentWatchdogPanel />
     </DashboardLayout>

@@ -86,6 +86,8 @@ mod errors;
 pub mod gas;
 #[cfg(test)]
 mod property_tests;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub use errors::Error;
@@ -97,7 +99,7 @@ pub use types::{
     CLAIM_WINDOW_SECS, COMMITMENT_DOMAIN, DEFAULT_BIDDING_DURATION_SECS,
     DEFAULT_REVEAL_DURATION_SECS, MAX_BIDDERS, MAX_BID_PRICE, MAX_PHASE_DURATION_SECS,
     MAX_REPUTATION, MAX_TERMS_LEN, MIN_PHASE_DURATION_SECS, PRICE_WEIGHT, REPUTATION_WEIGHT,
-    SCORE_SCALE,
+    SCORE_SCALE, ANTI_SNIPE_EXTENSION_SECS, ANTI_SNIPE_WINDOW_SECS,
 };
 
 use soroban_sdk::{
@@ -109,6 +111,7 @@ use soroban_sdk::{
 
 /// Threshold (ledgers remaining) below which we extend.
 const TTL_THRESHOLD: u32 = 100_000;
+const TTL_EXTEND_TO: u32 = 535_680;
 /// Target TTL after extension (~31 days at 5s ledgers).
 const CONTRACT_VERSION: &str = "1.0.0";
 
@@ -127,18 +130,6 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::Unauthorized)?;
     admin.require_auth();
     Ok(admin)
-}
-
-fn require_not_paused(env: &Env) -> Result<(), Error> {
-    let paused: bool = env
-        .storage()
-        .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false);
-    if paused {
-        return Err(Error::ContractPaused);
-    }
-    Ok(())
 }
 
 /// Extend TTL for a single persistent key, but only when it exists.
@@ -164,6 +155,39 @@ fn bidders_len(env: &Env, task_id: &Symbol) -> u32 {
         .get::<_, Vec<Address>>(&DataKey::Bidders(task_id.clone()))
         .map(|b| b.len())
         .unwrap_or(0)
+}
+
+/// Ask the optional agent registry whether `agent_id` is eligible.
+///
+/// When no registry is configured the check is a no-op, preserving the
+/// standalone deployment path. Registry error codes are mapped onto this
+/// contract's local error space so callers cannot distinguish a cross-contract
+/// failure from a local one.
+fn verify_agent_eligibility(env: &Env, agent_id: &Symbol) -> Result<(), Error> {
+    let registry: Option<Address> = env.storage().instance().get(&DataKey::AgentRegistry);
+    let registry_addr = match registry {
+        Some(addr) => addr,
+        None => return Ok(()),
+    };
+
+    use soroban_sdk::{vec, InvokeError, IntoVal, Val};
+    let fn_name = Symbol::new(env, "verify_agent_eligible");
+    let args = vec![env, agent_id.into_val(env)];
+
+    let res: Result<Result<Val, _>, Result<InvokeError, InvokeError>> =
+        env.try_invoke_contract(&registry_addr, &fn_name, args);
+
+    match res {
+        Ok(Ok(_)) => Ok(()),
+        Err(Ok(InvokeError::Contract(code))) | Err(Err(InvokeError::Contract(code))) => match code {
+            1 => Err(Error::AgentNotFound),
+            5 => Err(Error::AgentFrozen),
+            10 => Err(Error::InsufficientBond),
+            39 => Err(Error::AgentDeregistered),
+            _ => Err(Error::AgentNotEligible),
+        },
+        _ => Err(Error::AgentNotEligible),
+    }
 }
 
 /// Load an auction or fail with [`Error::NotFound`].
@@ -237,6 +261,19 @@ fn scaled_ratio(numerator: i128, denominator: i128) -> Result<i128, Error> {
         .checked_mul(numerator)
         .and_then(|scaled| scaled.checked_div(denominator))
         .ok_or(Error::ArithmeticOverflow)
+}
+
+fn require_not_paused(env: &Env) -> Result<(), Error> {
+    if env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+    {
+        Err(Error::ContractPaused)
+    } else {
+        Ok(())
+    }
 }
 
 // ─── Token helpers ───────────────────────────────────────────────────────────
@@ -335,21 +372,35 @@ impl AgentBiddingContract {
     }
 
     /// Admin: pause the contract.
+    ///
+    /// Blocks auction creation, bid submission, reveal, and award until
+    /// `unpause`. Emits `(bidding, paused)` with `(admin, ledger_sequence)`.
     pub fn pause(env: Env) -> Result<(), Error> {
-        require_admin(&env)?;
+        let admin = require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events()
-            .publish((symbol_short!("bidding"), symbol_short!("paused")), ());
+        env.events().publish(
+            (symbol_short!("bidding"), symbol_short!("paused")),
+            (admin, env.ledger().sequence()),
+        );
         Ok(())
     }
 
     /// Admin: unpause the contract.
+    ///
+    /// Emits `(bidding, unpaused)` with `(admin, ledger_sequence)`.
     pub fn unpause(env: Env) -> Result<(), Error> {
-        require_admin(&env)?;
+        let admin = require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events()
-            .publish((symbol_short!("bidding"), symbol_short!("unpaused")), ());
+        env.events().publish(
+            (symbol_short!("bidding"), symbol_short!("unpaused")),
+            (admin, env.ledger().sequence()),
+        );
         Ok(())
+    }
+
+    /// Alias of [`is_paused`](Self::is_paused) for coordinator reads.
+    pub fn get_paused(env: Env) -> bool {
+        Self::is_paused(env)
     }
 
     /// Returns whether the contract is currently paused.
@@ -419,11 +470,42 @@ impl AgentBiddingContract {
         env.storage().instance().get(&DataKey::Admin)
     }
 
+    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+        let stored_admin = require_admin(&env)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
     pub fn contract_version(env: Env) -> String {
         env.storage()
             .instance()
             .get(&DataKey::Version)
             .unwrap_or_else(|| String::from_str(&env, CONTRACT_VERSION))
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>, new_version: String) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        let old_version = Self::contract_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+        env.events().publish(
+            (symbol_short!("bidding"), symbol_short!("upgraded")),
+            (
+                old_version,
+                new_version,
+                new_wasm_hash,
+                admin,
+                env.ledger().sequence(),
+            ),
+        );
+        Ok(())
     }
 
     // ── Creation ─────────────────────────────────────────────────────────
@@ -529,6 +611,13 @@ impl AgentBiddingContract {
         Ok(())
     }
 
+    /// Admin: set the agent registry address.
+    pub fn set_agent_registry(env: Env, registry: Address) -> Result<(), Error> {
+        let _admin = require_admin(&env)?;
+        env.storage().instance().set(&DataKey::AgentRegistry, &registry);
+        Ok(())
+    }
+
     // ── Submit Sealed Bid ─────────────────────────────────────────────────
 
     /// Submit a sealed bid during the bidding period.
@@ -555,6 +644,7 @@ impl AgentBiddingContract {
     ) -> Result<(), Error> {
         require_not_paused(&env)?;
         bidder.require_auth();
+        verify_agent_eligibility(&env, &task_id)?;
 
         let mut auction = load_auction(&env, &task_id)?;
         require_live(&auction)?;
@@ -625,6 +715,23 @@ impl AgentBiddingContract {
         extend_ttl_for_key(&env, &bidders_key);
 
         auction.bid_count += 1;
+
+        // Prevent a last-second commitment from ending the bidding window
+        // before other participants can observe and respond. Cap the moving
+        // deadline at the contract's maximum phase horizon so repeated bids
+        // cannot hold funds indefinitely.
+        if auction.deadline.saturating_sub(now) <= ANTI_SNIPE_WINDOW_SECS {
+            let cap = auction
+                .created_at
+                .saturating_add(MAX_PHASE_DURATION_SECS);
+            let extension = auction
+                .deadline
+                .saturating_add(ANTI_SNIPE_EXTENSION_SECS)
+                .min(cap)
+                .saturating_sub(auction.deadline);
+            auction.deadline = auction.deadline.saturating_add(extension);
+            auction.reveal_deadline = auction.reveal_deadline.saturating_add(extension);
+        }
         save_auction(&env, &auction);
 
         // Bid position (1-based) within this auction, stamped before the

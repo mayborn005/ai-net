@@ -63,7 +63,7 @@ fn create_test_auction(
 
 /// Recompute the commitment hash from plaintext fields.
 /// Mirrors `compute_commitment` in the contract and `commitment_of`.
-fn test_commitment(
+pub(crate) fn test_commitment(
     client: &AgentBiddingContractClient<'_>,
     task_id: &Symbol,
     bidder: &Address,
@@ -435,6 +435,75 @@ fn prop_escrow_not_created_before_award() {
 
         let escrow = client.get_escrow(&task_id).unwrap();
         assert_eq!(escrow.amount, price);
+    }
+}
+
+/// The bidding window is half open: a bid at the deadline is rejected.
+#[test]
+fn prop_bid_exactly_at_deadline_is_rejected() {
+    let (env, client) = setup();
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let task_id = Symbol::new(&env, "deadline_bid");
+    create_test_auction(&env, &client, &creator, &task_id, 3600);
+    let salt = BytesN::<32>::from_array(&env, &[31; 32]);
+    let terms = String::from_str(&env, "");
+    let commitment = test_commitment(&client, &task_id, &bidder, 2_000_000, &terms, &salt);
+    fund(&env, &client, &bidder);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3600);
+    assert!(client
+        .try_submit_bid(&task_id, &bidder, &commitment, &500_000, &50)
+        .is_err());
+}
+
+/// The reveal window is also half open: reveal at its deadline is rejected.
+#[test]
+fn prop_reveal_exactly_at_deadline_is_rejected() {
+    let (env, client) = setup();
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let task_id = Symbol::new(&env, "deadline_reveal");
+    create_test_auction(&env, &client, &creator, &task_id, 3600);
+    let salt = BytesN::<32>::from_array(&env, &[32; 32]);
+    let terms = String::from_str(&env, "");
+    let commitment = test_commitment(&client, &task_id, &bidder, 2_000_000, &terms, &salt);
+    fund(&env, &client, &bidder);
+    client.submit_bid(&task_id, &bidder, &commitment, &500_000, &50);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 3600 + 3600);
+    assert!(client
+        .try_reveal_bid(&task_id, &bidder, &2_000_000, &terms, &salt)
+        .is_err());
+}
+
+/// A committed bid without a valid reveal is excluded from award selection,
+/// even when its hidden price/reputation combination would score better.
+#[test]
+fn prop_unrevealed_bid_never_wins() {
+    for _ in 0..20 {
+        let (env, client) = setup();
+        let creator = Address::generate(&env);
+        let revealed = Address::generate(&env);
+        let hidden = Address::generate(&env);
+        let task_id = Symbol::new(&env, "reveal_eligibility");
+        create_test_auction(&env, &client, &creator, &task_id, 3600);
+        submit_only(&env, &client, &task_id, &revealed, 8_000_000, 0, 41);
+        submit_only(
+            &env,
+            &client,
+            &task_id,
+            &hidden,
+            1_000_000,
+            MAX_REPUTATION,
+            42,
+        );
+        env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+        reveal_only(&env, &client, &task_id, &revealed, 8_000_000, 41);
+        client.reveal_bids(&creator, &task_id);
+        client.award_contract(&creator, &task_id);
+        let escrow = client.get_escrow(&task_id).unwrap();
+        assert_eq!(escrow.agent, revealed);
+        assert_eq!(escrow.amount, 8_000_000);
     }
 }
 

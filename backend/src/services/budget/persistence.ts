@@ -8,6 +8,8 @@
 
 import { createLogger } from '../../utils/logger';
 import { createTaskDb, getTaskDb, type PersistedTaskCost, type TaskDb } from '../../db/tasks';
+import { quotaMetricsRegistry } from '../quota/metrics';
+import { recordWalletTokenSpend } from '../quota/walletQuota';
 import {
   activeSnapshots,
   getLedger,
@@ -93,6 +95,20 @@ function toPersistedCost(snapshot: TaskCostSnapshot, settledAt: string): Persist
 }
 
 /**
+ * Fold a settled task's tokens into the quota metrics.
+ *
+ * Best-effort for the same reason as the persistence below it: telemetry must
+ * never be able to fail a task that already ran and already cost money.
+ */
+function countTaskSpend(tokens: number): void {
+  try {
+    quotaMetricsRegistry().recordTaskSpend({ tokens });
+  } catch (err) {
+    log.warn({ err }, 'failed to record task token spend metric');
+  }
+}
+
+/**
  * Snapshot a settled task into `task_costs` and release its ledger.
  *
  * Called when a task reaches a terminal state, so the in-memory footprint
@@ -101,6 +117,20 @@ function toPersistedCost(snapshot: TaskCostSnapshot, settledAt: string): Persist
 export function settleTaskCost(taskId: string): TaskCostSnapshot | undefined {
   const snapshot = takeLedgerSnapshot(taskId);
   if (!snapshot) return undefined;
+
+  // Count the spend before touching the database. The trailing-24h gauge is
+  // read from `task_costs` at scrape time, but the lifetime counter has no
+  // durable home, and a persistence failure must not swallow the token count.
+  countTaskSpend(snapshot.usedTokens);
+
+  // Fold the settled spend into the wallet's daily Venice-token quota
+  // (Issue #803). Best-effort for the same reason: accounting never fails a
+  // run that already cost money.
+  try {
+    recordWalletTokenSpend(snapshot.walletPublicKey, snapshot.usedTokens);
+  } catch (err) {
+    log.warn({ err, taskId }, 'failed to record wallet token quota spend');
+  }
 
   try {
     taskDb().upsertTaskCost(toPersistedCost(snapshot, now()));

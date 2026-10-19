@@ -75,8 +75,14 @@ jobs:
       - name: Type-check and build
         run: npm run build
 
+      - name: Enforce gzipped route bundle budgets
+        run: npm run size
+
       - name: Unit tests & coverage
         run: npm run test:coverage
+
+      - name: OpenAPI contract tests
+        run: npm run test:contract
 
       - name: Performance latency budgets
         run: npm run test:performance
@@ -108,6 +114,9 @@ jobs:
       # module declarations, so a missing stylesheet only fails at bundle time.
       - name: Check relative asset imports resolve
         run: npm run check:imports
+
+      - name: Check locale key parity
+        run: npm run i18n:check
 
       - name: Lint check
         run: npm run lint
@@ -162,12 +171,22 @@ jobs:
           path: frontend/playwright-report-visual/
           retention-days: 14
 
+      - name: Upload visual diff artifacts (actual/diff/expected PNGs)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-visual-diffs
+          path: frontend/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Link visual diffs in job summary
         if: failure()
         run: |
           {
             echo "### Visual regression diffs detected";
             echo "Open the **playwright-visual-report** artifact attached to this run (Summary tab → Artifacts) and load \`index.html\` for side-by-side expected/actual/diff images per failing snapshot.";
+            echo "Raw PNGs (actual/diff/expected) are in the **playwright-visual-diffs** artifact (\`frontend/test-results/\`).";
           } >> "$GITHUB_STEP_SUMMARY"
 
   contracts:
@@ -180,14 +199,14 @@ jobs:
     env:
       # ── Rust resource limits ──────────────────────────────────────────
       # Run only 1 cargo job at a time (one crate compiled in parallel max).
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: '1'
       # 1 codegen unit = lower peak RAM; rustc won't split crates into many
       # parallel LLVM modules. Mirrors smart-contracts/.cargo/config.toml so
       # the flag is enforced even if the config file is not picked up.
-      RUSTFLAGS: "-C codegen-units=1"
+      RUSTFLAGS: '-C codegen-units=1'
       # Disable incremental compilation in CI — it saves time only on local
       # re-builds; in CI it just wastes disk/RAM building the cache layer.
-      CARGO_INCREMENTAL: "0"
+      CARGO_INCREMENTAL: '0'
     defaults:
       run:
         working-directory: smart-contracts
@@ -233,12 +252,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Cargo clippy
-        run: cargo clippy --locked -p error-resolver -p error-registry -p agent_registry -p agent-bidding -p upgrade-manager -p agent-marketplace -p task-store -p dispute-resolution --all-targets -- -D warnings
+        run: cargo clippy --locked -p error-resolver -p error-registry -p agent_registry -p agent-bidding -p upgrade-manager -p agent-marketplace -p task-store -p dispute-resolution -p oracle-manager -p agent-governance --all-targets -- -D warnings
 
       # `--locked` keeps CI on the workspace lockfile resolution, which pins
       # ed25519-dalek to a version compatible with current stable Rust.
       - name: Cargo tests
-        run: cargo test --locked -p error-resolver -p error-registry -p agent_registry -p agent-bidding -p upgrade-manager -p agent-marketplace -p task-store -p dispute-resolution
+        run: cargo test --locked -p error-resolver -p error-registry -p agent_registry -p agent-bidding -p upgrade-manager -p agent-marketplace -p task-store -p dispute-resolution -p oracle-manager -p agent-governance
 
       # Optimized Wasm builds for the deployable contracts.
       # (error-resolver is exercised natively above; its Wasm target is
@@ -254,6 +273,27 @@ jobs:
           cargo build --locked -p dispute-resolution --target wasm32v1-none --release
           cargo build --locked -p upgrade-manager --target wasm32v1-none --release
           ls -la target/wasm32v1-none/release/*.wasm
+
+      - name: Enforce Wasm size budgets
+        run: node scripts/check-wasm-size.mjs
+
+      - name: Upload Wasm size report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-size-report
+          path: smart-contracts/wasm-size-report.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Validate event topic convention
+        run: node scripts/check-events.mjs
+
+      - name: Regenerate TypeScript clients and check drift
+        run: |
+          npm run codegen
+          git diff --exit-code -- src/generated
+          test -z "$(git status --porcelain -- src/generated)"
 
   # ── Backend E2E: smoke (registry/list/create) ───────────────────────────────
   # Fast, deterministic smoke covering POST /api/agents/register,
@@ -292,7 +332,7 @@ jobs:
           command: cd backend && npx jest --config ../tests/e2e/jest.config.js --runInBand --forceExit --testPathPattern="scenario-a-registration" --json --outputFile=../test-results-backend-smoke.json
         env:
           NODE_ENV: test
-          SKIP_STELLAR_ACCOUNT_VERIFY: "true"
+          SKIP_STELLAR_ACCOUNT_VERIFY: 'true'
           STELLAR_TEST_SECRET: ${{ secrets.STELLAR_TEST_SECRET }}
           VENICE_API_KEY: ${{ secrets.VENICE_API_KEY }}
 
@@ -343,7 +383,7 @@ jobs:
           command: cd backend && npx jest --config ../tests/e2e/jest.config.js --runInBand --forceExit --testPathPattern="scenario-b|scenario-c|full-pipeline|agent-lifecycle" --json --outputFile=../test-results-backend-heavy.json
         env:
           NODE_ENV: test
-          SKIP_STELLAR_ACCOUNT_VERIFY: "true"
+          SKIP_STELLAR_ACCOUNT_VERIFY: 'true'
           STELLAR_TEST_SECRET: ${{ secrets.STELLAR_TEST_SECRET }}
           VENICE_API_KEY: ${{ secrets.VENICE_API_KEY }}
 
@@ -396,7 +436,7 @@ jobs:
           retry_wait_seconds: 10
           command: cd frontend && npx playwright test tests/e2e/agent-registry.spec.ts tests/e2e/task-submission.spec.ts --reporter=html
         env:
-          CI: "true"
+          CI: 'true'
 
       - name: Upload frontend smoke Playwright report (flake tracking)
         if: always()
@@ -447,7 +487,7 @@ jobs:
           retry_wait_seconds: 10
           command: cd frontend && npx playwright test tests/e2e/task-monitoring.spec.ts tests/e2e/wallet.spec.ts tests/e2e/i18n.spec.ts --reporter=html
         env:
-          CI: "true"
+          CI: 'true'
 
       - name: Upload frontend heavy Playwright report (flake tracking)
         if: always()
@@ -468,7 +508,17 @@ jobs:
   ci-gate:
     name: ci-gate (required)
     if: always()
-    needs: [changes, backend, frontend, contracts, e2e-backend-smoke, e2e-backend-heavy, e2e-frontend-smoke, e2e-frontend-heavy]
+    needs:
+      [
+        changes,
+        backend,
+        frontend,
+        contracts,
+        e2e-backend-smoke,
+        e2e-backend-heavy,
+        e2e-frontend-smoke,
+        e2e-frontend-heavy,
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -535,7 +585,7 @@ jobs:
         if: env.STELLAR_COORDINATOR_SECRET != '' && env.VENICE_API_KEY != ''
         run: npm run test:integration
         env:
-          RUN_INTEGRATION_TESTS: "true"
+          RUN_INTEGRATION_TESTS: 'true'
 
       - name: Skip notice
         if: env.STELLAR_COORDINATOR_SECRET == '' || env.VENICE_API_KEY == ''

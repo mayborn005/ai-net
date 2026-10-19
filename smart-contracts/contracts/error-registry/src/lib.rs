@@ -14,6 +14,13 @@ pub const MAX_CLEANUP_BATCH: u32 = 100;
 pub const DEFAULT_CLEANUP_BATCH: u32 = 50;
 pub const CONTRACT_VERSION: &str = "1.0.0";
 
+/// Maximum number of records allowed under a single code index.
+pub const MAX_CODE_INDEX_SIZE: u32 = 500;
+/// Default TTL threshold (ledgers remaining) below which we extend.
+pub const TTL_THRESHOLD: u32 = 100_000;
+/// Target TTL after extension (~31 days at 5s ledgers).
+pub const TTL_EXTEND_TO: u32 = 535_680;
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -40,16 +47,23 @@ pub enum Error {
     Unauthorized = 7,
     UpgradeFailed = 8,
     RollbackNotAvailable = 9,
+    /// Secondary index capacity reached for an error code.
+    MaxCapacityReached = 10,
 }
 
 #[contract]
 pub struct ErrorRegistryContract;
 
-fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage()
+fn require_admin(env: &Env) -> Result<Address, Error> {
+    let admin: Address = env
+        .storage()
         .instance()
         .get(&DataKey::Admin)
-        .ok_or(Error::NotInitialized)?;
+        .ok_or(Error::NotInitialized)
+}
+
+fn require_admin(env: &Env) -> Result<Address, Error> {
+    let admin = read_admin(env)?;
     admin.require_auth();
     Ok(admin)
 }
@@ -239,9 +253,7 @@ impl ErrorRegistryContract {
         env.storage()
             .instance()
             .set(&DataKey::Version, &rollback_version);
-        env.storage()
-            .instance()
-            .remove(&DataKey::LastUpgradeLedger);
+        env.storage().instance().remove(&DataKey::LastUpgradeLedger);
 
         env.events().publish(
             (symbol_short!("upgrade"), symbol_short!("rollback")),
@@ -333,7 +345,7 @@ impl ErrorRegistryContract {
 
     pub fn get_error(env: Env, error_id: BytesN<32>) -> Option<ErrorRecord> {
         let now = env.ledger().timestamp();
-        let key = DataKey::Record(error_id);
+        let key = DataKey::Record(error_id.clone());
         if env.storage().persistent().has(&key) {
             env.storage()
                 .persistent()
@@ -341,7 +353,7 @@ impl ErrorRegistryContract {
         }
         env.storage()
             .persistent()
-            .get(&DataKey::Record(error_id))
+            .get(&key)
             .filter(|record: &ErrorRecord| is_active(now, record))
     }
 
@@ -351,11 +363,7 @@ impl ErrorRegistryContract {
 
         let mut records = Vec::new(&env);
         for id in ids.iter() {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Record(id))
-            {
+            if let Some(record) = env.storage().persistent().get(&DataKey::Record(id)) {
                 if is_active(now, &record) {
                     records.push_back(record);
                 }
@@ -391,11 +399,7 @@ impl ErrorRegistryContract {
 
             scanned += 1;
             let error_key = DataKey::Record(id.clone());
-            match env
-                .storage()
-                .persistent()
-                .get(&error_key)
-            {
+            match env.storage().persistent().get(&error_key) {
                 Some(record) if is_active(now, &record) => {
                     kept_ids.push_back(id);
                 }

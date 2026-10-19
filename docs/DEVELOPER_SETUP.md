@@ -8,26 +8,28 @@ Welcome to **AI-Net**! This guide takes you from a clean machine checkout to a f
 
 Install the following foundational toolchains before starting:
 
-| Tool | Recommended Version | Purpose | Installation Guide |
-|---|---|---|---|
-| **Node.js** | `v20.x LTS` (or `v22.x`) | Backend API & Next.js Frontend | [nodejs.org](https://nodejs.org/) |
-| **npm** | `v10.x+` | Package management | Included with Node.js |
-| **Rust & Cargo** | `v1.80.0+` | Soroban Smart Contracts | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| **WASM Target** | `wasm32-unknown-unknown` | Compiling Rust to WebAssembly | `rustup target add wasm32-unknown-unknown` |
-| **Stellar CLI** | `v21.x+` | Soroban contract deployments & RPC | `cargo install --locked stellar-cli --features opt` |
-| **Docker & Compose** | `v24.x+` / Compose `v2.x+` | PostgreSQL, Redis, and local node | [docker.com](https://www.docker.com/) |
+| Tool                 | Recommended Version        | Purpose                            | Installation Guide                                                |
+| -------------------- | -------------------------- | ---------------------------------- | ----------------------------------------------------------------- |
+| **Node.js**          | `v20.x LTS` (or `v22.x`)   | Backend API & Next.js Frontend     | [nodejs.org](https://nodejs.org/)                                 |
+| **npm**              | `v10.x+`                   | Package management                 | Included with Node.js                                             |
+| **Rust & Cargo**     | `v1.80.0+`                 | Soroban Smart Contracts            | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| **WASM Target**      | `wasm32-unknown-unknown`   | Compiling Rust to WebAssembly      | `rustup target add wasm32-unknown-unknown`                        |
+| **Stellar CLI**      | `v21.x+`                   | Soroban contract deployments & RPC | `cargo install --locked stellar-cli --features opt`               |
+| **Docker & Compose** | `v24.x+` / Compose `v2.x+` | PostgreSQL, Redis, and local node  | [docker.com](https://www.docker.com/)                             |
 
 ---
 
 ## 2. Quick Start (All-in-One Local Setup)
 
 ### Step 1: Clone Repository
+
 ```bash
 git clone https://github.com/Epta-Node/ai-net.git
 cd ai-net
 ```
 
 ### Step 2: Configure Environment Variables
+
 Copy the example environment configurations:
 
 ```bash
@@ -36,6 +38,7 @@ cp frontend/.env.example frontend/.env.local
 ```
 
 Default local `.env` values:
+
 ```ini
 # Backend configuration (.env)
 PORT=3000
@@ -47,6 +50,7 @@ VENICE_API_KEY=mock_local_key
 ```
 
 ### Step 3: Start Infrastructure via Docker Compose
+
 Start PostgreSQL 16 and Redis 7 in the background:
 
 ```bash
@@ -54,6 +58,7 @@ docker-compose up -d postgres redis
 ```
 
 ### Step 4: Install Dependencies & Run Database Migrations
+
 ```bash
 # Install root, backend, and frontend packages
 npm install
@@ -63,7 +68,22 @@ cd backend && npm install && cd ../frontend && npm install && cd ..
 cd backend && npm run db:migrate && cd ..
 ```
 
+#### Rolling back a migration
+
+Each migration in `backend/src/db/migrations/` may end with a `-- migrate:down` section holding the SQL that reverses it. `db:rollback` reverts the newest applied migration of the consolidated database (the one `db:migrate:status` reports on); pass `--steps N` to revert more:
+
+```bash
+cd backend
+npm run db:rollback               # revert the newest migration
+npm run db:rollback -- --steps 2  # revert the newest two
+```
+
+A migration without a `-- migrate:down` section is irreversible. If any migration a rollback would revert is irreversible, the command exits with an error naming it and reverts nothing. Applied-state tracking lives in the `schema_migrations` table: a reverted migration's row is removed, so `npm run db:migrate:status` shows it as pending again.
+
+The migration test suite rehearses `up -> down -> up` on a scratch in-memory database and asserts the schema is identical afterwards; it runs with the rest of the backend tests in CI (`npm run test:coverage`).
+
 ### Step 5: Start Development Servers
+
 ```bash
 # In Terminal 1 — Backend API:
 cd backend && npm run dev
@@ -72,14 +92,15 @@ cd backend && npm run dev
 cd frontend && npm run dev
 ```
 
-* **Backend API**: `http://localhost:3000` (`http://localhost:3000/health`)
-* **Frontend Web App**: `http://localhost:3001` (or `http://localhost:3000`)
+- **Backend API**: `http://localhost:3000` (`http://localhost:3000/health`)
+- **Frontend Web App**: `http://localhost:3001` (or `http://localhost:3000`)
 
 ---
 
 ## 3. Stellar Soroban Smart Contract Development
 
 ### 3.1 Build Smart Contracts
+
 Compile all smart contracts to optimized WebAssembly (`.wasm`):
 
 ```bash
@@ -88,6 +109,7 @@ cargo build --target wasm32-unknown-unknown --release
 ```
 
 ### 3.2 Run Smart Contract Tests
+
 Execute the Rust unit and contract invariant test suite:
 
 ```bash
@@ -97,11 +119,13 @@ cargo test
 ### 3.3 Deploy to Stellar Testnet
 
 1. **Generate a Developer Keypair**:
+
    ```bash
    stellar keys generate alice --network testnet
    ```
 
 2. **Fund Keypair via Friendbot Faucet**:
+
    ```bash
    stellar keys fund alice --network testnet
    # Or using curl:
@@ -151,24 +175,43 @@ cd smart-contracts && cargo test
 cd backend && npm run test:e2e
 ```
 
+### Regenerating Soroban TypeScript clients
+
+After changing a contract entrypoint, build the contracts and regenerate the
+typed clients in one command:
+
+```bash
+cd smart-contracts
+cargo build --locked --target wasm32v1-none --release
+npm run codegen
+```
+
+The generator reads the exported contract spec from each built Wasm file and
+writes marked generated files under `smart-contracts/src/generated/`. Do not
+edit those files by hand. CI regenerates the clients and fails if the
+committed output differs from the contract specs.
+
 ---
 
 ## 6. Operating System Quirks & Troubleshooting
 
 ### 🐧 Linux (Ubuntu / Debian / Arch / Fedora)
-* **Docker permissions**: Ensure your user is in the `docker` group (`sudo usermod -aG docker $USER && newgrp docker`).
-* **File Watcher Limits**: If `npm run dev` fails with `ENOSPC`, increase inotify watchers:
+
+- **Docker permissions**: Ensure your user is in the `docker` group (`sudo usermod -aG docker $USER && newgrp docker`).
+- **File Watcher Limits**: If `npm run dev` fails with `ENOSPC`, increase inotify watchers:
   ```bash
   echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
   ```
 
 ### 🍏 macOS (Apple Silicon M1/M2/M3)
-* **Rust WASM target**: Install Xcode command line tools (`xcode-select --install`).
-* **Docker Colima / OrbStack**: Ensure port forwarding is enabled for `5432` and `6379`.
+
+- **Rust WASM target**: Install Xcode command line tools (`xcode-select --install`).
+- **Docker Colima / OrbStack**: Ensure port forwarding is enabled for `5432` and `6379`.
 
 ### 🪟 Windows (WSL2 Required)
-* **Always run inside WSL2 (Ubuntu)**: Avoid running Node/Rust in native Windows CMD/PowerShell to prevent path and symlink issues.
-* **Git Line Endings**: Configure autocrlf to prevent newline mismatches in bash scripts:
+
+- **Always run inside WSL2 (Ubuntu)**: Avoid running Node/Rust in native Windows CMD/PowerShell to prevent path and symlink issues.
+- **Git Line Endings**: Configure autocrlf to prevent newline mismatches in bash scripts:
   ```bash
   git config --global core.autocrlf input
   ```

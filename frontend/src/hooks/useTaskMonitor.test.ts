@@ -120,4 +120,35 @@ describe('useTaskMonitor initial payments', () => {
     expect(result.current.task?.dag).toHaveLength(7);
     expect(result.current.payments).toEqual([]);
   });
+
+  it('surfaces fetch errors without hanging in loading', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    getTask.mockRejectedValue(new Error('boom'));
+
+    const { result } = renderHook(() => useTaskMonitor('task-1'));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.error).toMatchObject({ message: 'boom' });
+    expect(result.current.task).toBeNull();
+    errSpy.mockRestore();
+  });
+
+  it('does not fetch when taskId is undefined (empty path)', async () => {
+    const { result } = renderHook(() => useTaskMonitor(undefined));
+
+    await waitFor(() => expect(result.current.loading).toBe(true));
+    expect(getTask).not.toHaveBeenCalled();
+    expect(result.current.task).toBeNull();
+  });
+
+  it('refetch re-requests the task', async () => {
+    getTask.mockResolvedValue(task([]));
+    const { result } = renderHook(() => useTaskMonitor('task-1'));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(getTask).toHaveBeenCalledTimes(1);
+
+    result.current.refetch();
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+  });
 });

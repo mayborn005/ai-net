@@ -26,4 +26,6 @@ pub enum Error {
     OracleNotInitialized = 9,
     /// The oracle contract is currently paused.
     OraclePaused = 10,
+    /// The configured oracle has no feed for the pair and no fallback exists.
+    FeedNotFound = 11,
 }

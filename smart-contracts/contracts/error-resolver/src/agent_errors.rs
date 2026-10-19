@@ -16,6 +16,8 @@ pub const TTL_EXTEND_TO: u32 = 535_680;
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Whether the contract is paused (instance storage).
+    Paused,
     Version,
     AuthorizedCallers,
     AgentErrorCount(Symbol),
@@ -23,8 +25,6 @@ pub enum DataKey {
     Quorum,
     PendingOps,
     AuditLog,
-    /// Whether the contract is paused (instance storage).
-    Paused,
 }
 
 /// A pending allowlist operation awaiting quorum approvals.
@@ -742,6 +742,6 @@ mod test {
 
         client.add_authorized_caller(&registry);
         let log = client.get_audit_log();
-        assert!(log.len() >= 1);
+        assert!(!log.is_empty());
     }
 }

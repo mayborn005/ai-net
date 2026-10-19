@@ -2,6 +2,25 @@
 
 use soroban_sdk::{contracttype, Address, Symbol};
 
+/// Privileged action that must wait out the timelock before executing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminAction {
+    /// Lift the pause.
+    Unpause,
+    /// Set the payment asset and its decimals.
+    SetPaymentAsset(Address, u32),
+}
+
+/// An admin action queued with the earliest time it can be executed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedAction {
+    pub action: AdminAction,
+    /// Ledger timestamp from which the action may be executed.
+    pub eta: u64,
+}
+
 /// On-chain representation of a service listing.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

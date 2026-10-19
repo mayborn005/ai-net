@@ -10,7 +10,7 @@ import type { QualityScore } from "../services/qualityScorer.types";
 export type TaskStatus = "queued" | "running" | "completed" | "cancelled" | "failed";
 
 /** Node-level statuses used by the coordinator during DAG execution. */
-export type NodeStatus = "pending" | "running" | "completed" | "failed";
+export type NodeStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 export interface DAGNode {
   nodeId: string;
@@ -50,6 +50,8 @@ export type DAGEventType =
   | "payment_released"
   | "task_completed"
   | "task_failed"
+  /** A job exhausted its retry budget and was parked in the DLQ (issue #802). */
+  | "job.dead_lettered"
   | "AgentFailedOver"
   | "AgentRecovered"
   | "AgentMarkedOffline";

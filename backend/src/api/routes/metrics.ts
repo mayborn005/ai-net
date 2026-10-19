@@ -5,12 +5,16 @@
  *  - GET /metrics         — Prometheus text format scrape target
  *  - GET /metrics/health  — Scrape reliability and uptime diagnostics
  *  - POST /metrics/reset  — Safe metrics reset
+ *
+ * Includes the per-wallet daily quota and task token-budget families from
+ * `services/quota/metrics` (Issue #738). See docs/operations/quota-metrics.md.
  */
 
 import { Router, Request, Response, NextFunction } from "express";
 import { adminAuthMiddleware } from "../middleware/auth";
 import { metricsService, MetricsService } from "../../services/metrics";
 import { generatePrometheusMetrics } from "../../services/prometheus";
+import { quotaMetricsRegistry } from "../../services/quota/metrics";
 
 export interface MetricsRouterOptions {
   service?: MetricsService;
@@ -148,6 +152,10 @@ export function createMetricsRouter(options: MetricsRouterOptions = {}): Router 
    */
   router.post("/reset", adminAuthMiddleware, (_req: Request, res: Response): void => {
     service.resetPrometheusMetrics();
+    // The quota counters are process-owned rather than MetricsService-owned,
+    // so they need clearing explicitly or an operator's post-reset baseline
+    // would still carry every rejection the node has ever served.
+    quotaMetricsRegistry().reset();
     res.status(200).json({ status: "ok", message: "Metrics reset successfully" });
   });
 

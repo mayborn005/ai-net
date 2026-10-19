@@ -19,6 +19,13 @@ import {
 } from '../../services/auth/walletChallenge';
 import { TaskStreamHub } from './taskStreamHub';
 
+type TrustProxyFn = (address: string, hop: number) => boolean;
+type ProxyAddr = (req: IncomingMessage, trust: TrustProxyFn) => string;
+
+// Express depends on proxy-addr but does not expose its request resolver.
+// eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+const proxyaddr = require('proxy-addr') as ProxyAddr;
+
 const STREAM_PATH = /^\/(?:api\/)?tasks\/([^/?]+)\/stream(?:\?.*)?$/;
 
 /**
@@ -46,7 +53,7 @@ const logger = createLogger({ module: 'ws-stream' });
  * Clients use `event.type === 'task_completed'` / `event.seq` as a resume
  * cursor, so this mapping must be stable.
  */
-function toWireEvent(event: StoredEvent, traceId?: string): Record<string, unknown> {
+export function toWireEvent(event: StoredEvent, traceId?: string): Record<string, unknown> {
   const snakeType = event.type
     // PascalCase → snake_case: "NodeStarted" → "node_started"
     .replace(/([A-Z])/g, (_match, _p1, offset: number) =>
@@ -120,10 +127,10 @@ export function getStreamConnectionCount(): number {
   return total;
 }
 
-function getClientIp(req: IncomingMessage): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') return forwarded.split(',')[0].trim();
-  return req.socket.remoteAddress ?? 'unknown';
+export function getClientIp(req: IncomingMessage, trustProxy?: TrustProxyFn): string {
+  const remoteAddress = req.socket.remoteAddress ?? 'unknown';
+  if (!trustProxy || !req.headers['x-forwarded-for']) return remoteAddress;
+  return proxyaddr(req, trustProxy) || remoteAddress;
 }
 
 function trackConnection(ip: string): boolean {
@@ -182,12 +189,18 @@ export interface TaskStreamOptions {
 export interface TaskStreamDeps extends TaskStreamOptions {
   httpServer: HttpServer;
   eventStore: EventStore;
+  trustProxy?: TrustProxyFn;
   eventBus?: typeof defaultEventBus;
   getTask?: (taskId: string) => Task | undefined;
   /** Shared nonce store (defaults to a per-server store with the standard TTL). */
   nonceStore?: NonceStore;
   /** Nonce TTL override, mainly for tests. */
   nonceTtlMs?: number;
+  /**
+   * Fan-out hub to read through. Pass the one the SSE endpoint uses so both
+   * transports share a single bus subscription and bounded read per task.
+   */
+  streamHub?: TaskStreamHub;
 }
 
 /**
@@ -275,6 +288,7 @@ export function attachTaskStream(deps: TaskStreamDeps): () => void {
     eventStore,
     eventBus = defaultEventBus,
     getTask = defaultGetTask,
+    trustProxy,
     heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
     pongTimeoutMs = DEFAULT_PONG_TIMEOUT_MS,
     authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS,
@@ -288,7 +302,7 @@ export function attachTaskStream(deps: TaskStreamDeps): () => void {
   // client watching that task (#655). Clients used to each subscribe and each
   // re-query the store per tick, which made reads scale with the subscriber
   // count and tripped MaxListenersExceededWarning past 100 clients.
-  const streamHub = new TaskStreamHub({ store: eventStore, bus: eventBus });
+  const streamHub = deps.streamHub ?? new TaskStreamHub({ store: eventStore, bus: eventBus });
 
   const wss = new WebSocketServer({ noServer: true });
   activeStreamServers.add(wss);
@@ -301,7 +315,7 @@ export function attachTaskStream(deps: TaskStreamDeps): () => void {
     }
 
     // ── Connection rate limit ────────────────────────────────────────────
-    const clientIp = getClientIp(req);
+    const clientIp = getClientIp(req, trustProxy);
     if (!trackConnection(clientIp)) {
       logger.warn({ clientIp }, 'connection rate limit exceeded');
       socket.write(

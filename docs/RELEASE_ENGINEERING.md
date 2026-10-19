@@ -147,8 +147,8 @@ When upgrading deployed contracts:
 # Upgrade
 ./scripts/upgrade.sh --network mainnet --use-upgrade-manager agent-registry
 
-# Verify
-./scripts/verify.sh --network mainnet
+# Verify (required after every mainnet deploy or upgrade)
+./scripts/verify.sh --network mainnet --strict --json
 ```
 
 ---

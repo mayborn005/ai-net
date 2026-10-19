@@ -328,6 +328,30 @@ mod test {
         f.client.submit_price(&f.pair, &price, &ts);
     }
 
+    /// Every mutating entrypoint must reject while paused. Add new mutating
+    /// functions here so a missing pause guard fails this test.
+    #[test]
+    fn paused_state_rejects_all_mutating_entrypoints() {
+        let f = fixture();
+        init(&f);
+        let a = Address::generate(&f.env);
+        f.client.pause();
+
+        let paused = Err(Ok(Error::ContractPaused));
+        assert_eq!(f.client.try_set_admin(&a), paused);
+        assert_eq!(
+            f.client
+                .try_submit_price(&f.pair, &1_000_000i128, &1_700_000_000u64),
+            paused
+        );
+        assert_eq!(f.client.try_set_max_price_age(&60u64), paused);
+
+        f.client.unpause();
+        f.client.set_max_price_age(&60u64);
+        submit(&f, 1_000_000, 1_700_000_000);
+        f.client.set_admin(&a);
+    }
+
     // ── Initialisation ────────────────────────────────────────────────────────
 
     #[test]

@@ -204,3 +204,10 @@
   transition: opacity 0.15s;
 }
 .toast button:hover { opacity: 1; }
+
+/* Reduced motion (#721): toast entrances must not slide/fade. */
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+  }
+}

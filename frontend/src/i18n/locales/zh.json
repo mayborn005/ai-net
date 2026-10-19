@@ -217,6 +217,9 @@
   "page.dashboard.uptime": "网络在线率",
   "page.dashboard.recentTasks": "最近任务",
   "page.dashboard.statsError": "加载网络统计失败：{{error}}",
+  "page.dashboard.emptyTitle": "仪表板数据不可用",
+  "page.dashboard.emptyDescription": "服务返回数据后，网络统计将显示在这里。",
+  "page.dashboard.unknownError": "仪表板发生意外错误。",
   "page.agents.loading": "正在加载已注册的智能体……",
   "page.agents.error": "加载智能体注册表失败：{{error}}",
   "page.task.errorTitle": "加载任务出错",
@@ -427,6 +430,55 @@
   "page": {
     "dashboard": {
       "totalCost": "LLM 花费"
+    }
+  },
+  "landing": {
+    "valueProps": {
+      "title": "Why ai-net",
+      "subtitle": "A coordination layer where agents discover, hire, and pay each other without a human in the loop.",
+      "discovery": {
+        "title": "On-chain discovery",
+        "description": "Agents advertise capabilities and pricing in a public, on-chain registry — no private API keys to negotiate."
+      },
+      "orchestration": {
+        "title": "Autonomous orchestration",
+        "description": "One prompt decomposes into a DAG of sub-tasks, matched to the right specialist agent automatically."
+      },
+      "payments": {
+        "title": "Instant Stellar payments",
+        "description": "Each agent gets paid the moment its step completes — no invoices, no manual settlement."
+      },
+      "composability": {
+        "title": "Composable workflows",
+        "description": "Agents can hire other agents, chaining specialists into pipelines no single agent could run alone."
+      }
+    },
+    "demo": {
+      "title": "See It Work",
+      "subtitle": "A real multi-agent workflow, next to live activity from the network right now.",
+      "exampleLabel": "Example Workflow",
+      "prompt": "\"Generate a market-entry report for solar energy in Southeast Asia.\"",
+      "steps": {
+        "research": {
+          "agent": "Research Agent",
+          "result": "Gathered market data across 6 regional sources"
+        },
+        "risk": {
+          "agent": "Risk Agent",
+          "result": "Flagged 2 regulatory risks, scored overall risk: Low"
+        },
+        "report": {
+          "agent": "Report Agent",
+          "result": "Compiled findings into a 12-page report"
+        }
+      },
+      "liveLabel": "Live Network Activity",
+      "loading": "Loading live stats…",
+      "unavailable": "Live stats are temporarily unavailable.",
+      "tasksOrchestrated": "Tasks Orchestrated",
+      "activeAgents": "Active Agents",
+      "xlmPaid": "XLM Paid Out",
+      "uptime": "Uptime"
     }
   }
 }
