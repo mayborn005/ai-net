@@ -31,14 +31,16 @@ import {
   getStreamConnectionCount,
   type TaskStreamOptions,
 } from "./routes/stream";
+import { TaskStreamHub } from "./routes/taskStreamHub";
+import { createTaskEventsSseHandler } from "./routes/taskEventsSse";
 import type { DAGNode } from "../types/task";
 import { agentsRouter } from "./routes/agents";
-import { healthRouter } from "./routes/health";
+import { healthRouter, migrationsRouter } from "./routes/health";
 import { metricsRouter } from "./routes/metrics";
 import { createStatsRouter } from "./routes/stats";
 import { createReconciliationRouter, type ReconciliationRouterOptions } from "./routes/reconciliation";
 import { rateLimitMiddleware, registerRateLimitMiddleware, publicLimiter, authedLimiter, adminLimiter } from "./middleware/rateLimit";
-import { authMiddleware, adminAuthMiddleware } from "./middleware/auth";
+import { adminAuthMiddleware } from "./middleware/auth";
 import { createCorsMiddleware } from "./middleware/cors";
 import { compressionMiddleware } from "./middleware/compression";
 import { errorHandler } from "./middleware/errorHandler";
@@ -50,6 +52,7 @@ import { getOpenapiJson, getOpenapiYaml, openapiSpec, swaggerUiOptions } from ".
 import { createCostRouter } from "./routes/costs";
 import { createAgentWatchdogRouter } from "./routes/agentWatchdog";
 import { createAgentWatchdog } from "../services/agentWatchdog";
+import { invalidateAgentsCache } from "../cache/invalidation";
 import { flushActiveCosts, setPricingOverrides } from "../services/budget";
 import { createAdminRouter, createAdminQueueRouter } from "./routes/admin";
 import { createFlagsRouter } from "./routes/flags";
@@ -90,7 +93,7 @@ export interface AppOptions {
 
 function tryLoadStellarRelease(): StellarReleasePaymentFn | undefined {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     return require("../../../smart-contracts/src/payment/payment")
       .releasePayment as StellarReleasePaymentFn;
   } catch {
@@ -114,13 +117,29 @@ function tryLoadRegistryLookup():
   | undefined {
   if (!getConfig().REGISTRY_CONTRACT_ID) return undefined;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     return require("../../../smart-contracts/src/registry/registry") as {
       getAgent: (id: string) => unknown;
     };
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Route descriptor for endpoints that live behind an `API-Version` dispatcher.
+ *
+ * The task endpoints dispatch on the negotiated `API-Version` header, so they
+ * live behind a dispatcher function and cannot be recovered by walking the
+ * Express router stack. They are published here so route-introspection tooling
+ * (the OpenAPI parity test) can see the same routers the server dispatches to,
+ * instead of re-deriving the mount path and re-instantiating the factories.
+ */
+export interface VersionDispatchedRoutes {
+  /** Path the dispatching middleware is mounted at. */
+  mountPath: string;
+  /** Every router the dispatcher can route to, for the given mount path. */
+  routers: Router[];
 }
 
 export function createApp(opts: AppOptions = {}): {
@@ -132,7 +151,10 @@ export function createApp(opts: AppOptions = {}): {
   const logger = createLogger({ module: "api-app" });
   const app = express();
   const httpServer = createServer(app);
-  const eventStore = opts.eventStore ?? eventBus.store;
+  const eventStore = opts.eventStore ?? getEventStore();
+
+  app.set("trust proxy", config.TRUST_PROXY);
+  const trustProxy = app.get("trust proxy fn");
 
   app.use(express.json());
   app.use((_req, res, next) => {
@@ -149,7 +171,13 @@ export function createApp(opts: AppOptions = {}): {
   app.use(requestId);
   app.use(requestLogger);
   app.use(metricsMiddleware);
-  app.use(rateLimitMiddleware);
+  // Rate limiting is an edge concern: the limiter itself is covered directly by
+  // its unit suite, so the app-level mount is skipped under NODE_ENV=test (the
+  // same convention compression uses below) — otherwise integration suites
+  // throttle their own second request and assert against a 429.
+  if (config.NODE_ENV !== "test") {
+    app.use(rateLimitMiddleware);
+  }
   app.use(versioningMiddleware);
   app.use(
     readOnlyMiddleware({
@@ -166,11 +194,22 @@ export function createApp(opts: AppOptions = {}): {
     opts.releasePayment ?? createPaymentReleaseFn(tryLoadStellarRelease());
 
   const jobQueue = opts.queue ?? getGlobalJobQueue();
+  jobQueue.setDefaultMaxAttempts(config.JOB_MAX_ATTEMPTS);
   const jobWorker =
     opts.jobWorker ??
     new JobWorker({
       jobStore: jobQueue.getStore(),
       handler: createTaskJobHandler(dispatch, releasePayment),
+      // Leases (#648): a claimed job stays owned for JOB_LEASE_TTL_MS unless
+      // this worker renews it every JOB_LEASE_HEARTBEAT_MS. Startup recovery
+      // only reclaims jobs whose lease has lapsed, so a second instance coming
+      // up alongside this one cannot re-queue work that is still running.
+      leaseTtlMs: config.JOB_LEASE_TTL_MS,
+      leaseHeartbeatMs: config.JOB_LEASE_HEARTBEAT_MS,
+      // Retry policy (#752): full-jitter backoff, then the dead-letter queue.
+      baseBackoffMs: config.JOB_BACKOFF_BASE_MS,
+      maxBackoffMs: config.JOB_BACKOFF_MAX_MS,
+      maxAttempts: config.JOB_MAX_ATTEMPTS,
     });
   jobQueue.setWorker(jobWorker);
 
@@ -220,6 +259,8 @@ export function createApp(opts: AppOptions = {}): {
   const watchdog = createAgentWatchdog({
     intervalMs: config.AGENT_WATCHDOG_INTERVAL_MS,
     gracePeriodMinutes: config.AGENT_WATCHDOG_GRACE_MINUTES,
+    // Evicted agents must not be served from cached listings (#804).
+    invalidateCache: () => invalidateAgentsCache(),
     onEvict: registryLookup
       ? async (agent) => {
           const stillRegistered = registryLookup.getAgent(agent.id) !== undefined;
@@ -240,6 +281,10 @@ export function createApp(opts: AppOptions = {}): {
 
   // ── Health routes ───────────────────────────────────────────────────────────
   app.use("/health", publicLimiter.middleware, healthRouter);
+
+  // Schema migration status (Issue #274). Admin-guarded and rate limited like
+  // the other operational endpoints rather than the public health probes.
+  app.use("/migrations", adminLimiter.middleware, migrationsRouter);
 
   // ── Metrics routes (Issue #499) ───────────────────────────────────────────
   app.use("/metrics", metricsRouter);
@@ -272,10 +317,49 @@ export function createApp(opts: AppOptions = {}): {
     createAgentWatchdogRouter({ tick: () => watchdog.tick() }),
   );
 
+  /**
+   * @openapi
+   * /openapi.json:
+   *   get:
+   *     summary: Machine-readable OpenAPI specification (JSON)
+   *     operationId: getOpenapiJson
+   *     description: >
+   *       Serves the same OpenAPI 3.1.0 document that backs /api-docs, in
+   *       JSON form, for codegen and client tooling. Public: the spec is not
+   *       operational data, so it opts out of the spec-wide WalletAuth default.
+   *     tags: [System]
+   *     security: []
+   *     responses:
+   *       200:
+   *         description: OpenAPI 3.1.0 specification
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   */
   app.get("/openapi.json", (_req: Request, res: Response) => {
     res.json(getOpenapiJson());
   });
 
+  /**
+   * @openapi
+   * /openapi.yaml:
+   *   get:
+   *     summary: Machine-readable OpenAPI specification (YAML)
+   *     operationId: getOpenapiYaml
+   *     description: >
+   *       The OpenAPI 3.1.0 document in YAML form. Semantically equivalent to
+   *       `GET /openapi.json`. Public: opts out of the spec-wide WalletAuth default.
+   *     tags: [System]
+   *     security: []
+   *     responses:
+   *       200:
+   *         description: OpenAPI 3.1.0 specification (YAML)
+   *         content:
+   *           text/yaml:
+   *             schema:
+   *               type: string
+   */
   app.get("/openapi.yaml", (_req: Request, res: Response) => {
     res.type("text/yaml").send(getOpenapiYaml());
   });
@@ -286,6 +370,16 @@ export function createApp(opts: AppOptions = {}): {
   // Authenticated task creation uses the tighter authed limiter.
   const v1TasksRouter = createV1TasksRouter(dispatch, releasePayment, jobQueue);
   const v2TasksRouter = createV2TasksRouter(dispatch, releasePayment, jobQueue);
+
+  // SSE task event stream (#751). Shares one TaskStreamHub with the WebSocket
+  // stream so both transports use a single bus subscription and bounded read
+  // per task. Mounted ahead of the versioned dispatcher below.
+  const taskStreamHub = new TaskStreamHub({ store: eventStore, bus: eventBus });
+  app.get(
+    "/api/tasks/:id/events/stream",
+    authedLimiter.middleware,
+    createTaskEventsSseHandler({ hub: taskStreamHub })
+  );
 
   // The v1/v2 implementation is picked from the negotiated API version, so the
   // mount is a dispatcher function rather than a sub-router. That would make the
@@ -302,7 +396,11 @@ export function createApp(opts: AppOptions = {}): {
 
   // ── Admin Queue routes ─────────────────────────────────────────────────────
   app.use("/api/admin/queue", adminLimiter.middleware, createAdminQueueRouter(jobQueue));
-  app.use("/api/admin", adminLimiter.middleware, createAdminRouter({ queue: jobQueue, reconciliation: opts.reconciliation }));
+  app.use(
+    "/api/admin",
+    adminLimiter.middleware,
+    createAdminRouter({ queue: jobQueue, reconciliation: opts.reconciliation, watchdog }),
+  );
 
   // ── Feature-flag admin routes (#425) ───────────────────────────────────────
   app.use("/api/admin/flags", createFlagsRouter());
@@ -342,6 +440,8 @@ export function createApp(opts: AppOptions = {}): {
     eventStore,
     eventBus,
     getTask,
+    trustProxy,
+    streamHub: taskStreamHub,
     heartbeatIntervalMs: config.WS_HEARTBEAT_INTERVAL_MS,
     pongTimeoutMs: config.WS_PONG_TIMEOUT_MS,
     inactivityTimeoutMs: config.WS_INACTIVITY_TIMEOUT_MS,

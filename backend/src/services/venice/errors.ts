@@ -1,10 +1,12 @@
-export class CircuitOpenError extends Error {
-  constructor(message = 'Circuit breaker is OPEN — Venice requests are blocked') {
-    super(message);
-    this.name = 'CircuitOpenError';
-  }
-}
+/**
+ * The breaker throws the shared `CircuitOpenError` defined next to the breaker
+ * itself. Re-exporting it here keeps a single source of truth — Venice modules
+ * and `BaseAgent` all run `instanceof CircuitOpenError` against the error the
+ * breaker actually throws.
+ */
+export { CircuitOpenError } from '../circuitBreaker.js';
 
+/** Thrown when a request asks for more tokens than the hard cap allows. */
 export class TokenBudgetExceededError extends Error {
   constructor(requested: number, cap: number) {
     super(`Token budget exceeded: requested ${requested}, hard cap is ${cap}`);
@@ -29,5 +31,19 @@ export class VeniceStatusError extends Error {
     super(message ?? `Venice returned status: ${status}`);
     this.name = 'VeniceStatusError';
     this.status = status;
+  }
+}
+
+/**
+ * Thrown when every key in the pool is cooling down, so no upstream call can be
+ * made (#806). It is raised instead of hanging, and it counts as a breaker failure.
+ */
+export class VeniceUnavailableError extends Error {
+  readonly keyCount: number;
+
+  constructor(keyCount: number) {
+    super(`Venice AI is unavailable: all ${keyCount} configured key(s) are cooling down`);
+    this.name = 'VeniceUnavailableError';
+    this.keyCount = keyCount;
   }
 }

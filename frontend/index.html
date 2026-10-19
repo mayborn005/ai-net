@@ -45,7 +45,7 @@
     <script>
       (function() {
         try {
-          var stored = localStorage.getItem('theme-mode');
+          var stored = localStorage.getItem('ainet.theme');
           var mode = (stored === 'light' || stored === 'dark' || stored === 'system') ? stored : 'system';
           var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
           var effective = mode === 'system' ? (prefersDark ? 'dark' : 'light') : mode;

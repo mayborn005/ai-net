@@ -26,12 +26,42 @@ ai-net uses header-based cryptographic authentication schemes:
 - Used for creating tasks, retrieving task state, and managing owned resources.
 - Example: \`walletpublickey: GBZXN7PIRZGNMHGA728XZVOG2GUFIDLAZ6AF2I2MD2OCYTAF2K1K4AAA\`
 
-### 2. Agent Cryptographic Signature Authentication (\`AgentSignatureAuth\`)
+### 2. Agent Cryptographic Signature Authentication (\`AgentSignatureAuth\` + \`AgentChallengeAuth\`)
+- **Applies to:** \`POST /api/agents/register\`, \`POST /api/agents/:id/heartbeat\`, \`DELETE /api/agents/:id\`
 - **Headers:**
-  - \`x-signature: <Base64-or-Hex-Ed25519-Signature>\`
-  - \`x-challenge: <Signed-Challenge-String>\`
-- Used for agent de-registration and privileged agent operations.
-- The challenge string must match the challenge issued by the server within the replay window.
+  - \`x-challenge: <nonce>\` — the single-use, expiring nonce issued by the server
+  - \`x-signature: <Base64-or-Hex-Ed25519-Signature>\` — signature of the canonical message
+
+Obtain a challenge first:
+
+\`\`\`
+POST /api/agents/challenge
+{ "purpose": "register" | "heartbeat" | "delete",
+  "publicKey": "<agent Stellar public key>",
+  "agentId": "<required for heartbeat and delete>",
+  "payload": { ...the exact body you will send to the protected route } }
+
+→ 200 { "challenge": "...", "message": "ai-net:agent-auth:v1\\n<purpose>\\n<publicKey>\\n<challenge>\\n<sha256(payload)>", "expiresAt": "..." }
+\`\`\`
+
+Sign \`message\` with the agent's Stellar secret key and send both headers. The signature is
+verified against the registered \`stellarPublicKey\`, and the challenge is bound to the route
+purpose, the claimed key and a SHA-256 hash of the payload — so a signature is valid for exactly
+one request and cannot be replayed against another route, another payload, or another agent.
+
+| Failure | \`error.code\` | Meaning |
+|---|---|---|
+| No, unknown, expired, replayed or mismatched challenge | \`AGENT_CHALLENGE_INVALID\` | Request a new challenge and retry |
+| Missing, malformed or non-matching signature | \`AGENT_SIGNATURE_INVALID\` | The key does not control this agent |
+
+Both return HTTP 401. Failed *unsigned* attempts are throttled separately from the success path
+(\`AGENT_AUTH_FAILURE_LIMIT_MAX\` per IP per \`AGENT_AUTH_FAILURE_LIMIT_WINDOW_MS\`) so agent ids
+cannot be enumerated cheaply.
+
+**Migration:** while the \`agent_ownership_proof\` feature flag is disabled, unsigned
+\`register\` and \`heartbeat\` calls are still accepted and answered with \`Deprecation\`,
+\`Sunset\` and \`Warning\` headers (see \`AGENT_AUTH_SUNSET_DATE\`). \`DELETE\` always requires a
+signature. Unsigned calls are refused once the flag is on, which is the default.
 
 ---
 
@@ -44,9 +74,16 @@ Rate limit status is communicated via standard HTTP response headers:
 |---|---|
 | \`X-RateLimit-Limit\` | Maximum requests allowed within the current time window |
 | \`X-RateLimit-Remaining\` | Number of requests remaining in the current window |
-| \`X-RateLimit-Reset\` | Time (epoch seconds or ms) when the current window resets |
+| \`X-RateLimit-Reset\` | Unix time (epoch seconds) when the current window resets |
+| \`Retry-After\` | Seconds to wait before retrying — sent on \`429\` responses only |
 
-When rate limits are exceeded, the API returns \`429 Too Many Requests\` with an error payload explaining the retry delay.
+The \`X-RateLimit-*\` headers are sent on every response from a rate-limited route
+(public, authenticated and admin groups alike), not only on \`429\`, so clients can back off
+before they are throttled. When more than one limiter applies to a request, the headers
+describe the most restrictive one.
+
+When rate limits are exceeded, the API returns \`429 Too Many Requests\` with a
+\`RATE_LIMITED\` error payload and a \`Retry-After\` header.
 
 ---
 
@@ -137,6 +174,10 @@ List endpoints support standardized query parameters:
           description: "The time at which the current rate limit window resets in UTC epoch seconds.",
           schema: { type: "integer", example: 1724601600 },
         },
+        "Retry-After": {
+          description: "Seconds to wait before retrying. Sent on every `429 Too Many Requests` response.",
+          schema: { type: "integer", minimum: 1, example: 42 },
+        },
         "X-Request-Id": {
           description: "Unique request identifier for distributed tracing and logging.",
           schema: { type: "string", example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d" },
@@ -144,6 +185,22 @@ List endpoints support standardized query parameters:
         "X-API-Version": {
           description: "The negotiated API version used to process the request.",
           schema: { type: "string", example: "1.0" },
+        },
+      },
+      responses: {
+        TooManyRequests: {
+          description: "Rate limit exceeded. Wait `Retry-After` seconds (or until `X-RateLimit-Reset`) before retrying.",
+          headers: {
+            "Retry-After": { $ref: "#/components/headers/Retry-After" },
+            "X-RateLimit-Limit": { $ref: "#/components/headers/X-RateLimit-Limit" },
+            "X-RateLimit-Remaining": { $ref: "#/components/headers/X-RateLimit-Remaining" },
+            "X-RateLimit-Reset": { $ref: "#/components/headers/X-RateLimit-Reset" },
+          },
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/RateLimitError" },
+            },
+          },
         },
       },
       schemas: {
@@ -319,12 +376,57 @@ List endpoints support standardized query parameters:
             stellarNetwork: { type: "string", example: "testnet" },
           },
         },
+        DependencyHealth: {
+          type: "object",
+          required: ["status", "critical", "latencyMs", "detail"],
+          additionalProperties: true,
+          properties: {
+            status: { type: "string", enum: ["ok", "degraded", "fail"], example: "ok" },
+            critical: { type: "boolean", example: true },
+            latencyMs: { type: "number", example: 42 },
+            detail: { type: "string", example: "reachable" },
+          },
+        },
         DeepHealthStatus: {
           type: "object",
-          required: ["venice", "horizon"],
+          required: ["status", "checkedAt", "durationMs", "dependencies", "failing", "degraded"],
           properties: {
-            venice: { type: "string", enum: ["ok", "unreachable"], example: "ok" },
-            horizon: { type: "string", enum: ["ok", "unreachable"], example: "ok" },
+            status: { type: "string", enum: ["ok", "degraded", "fail"], example: "ok" },
+            checkedAt: { type: "string", format: "date-time" },
+            durationMs: { type: "number", example: 120 },
+            dependencies: {
+              type: "object",
+              properties: {
+                venice: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Includes `breaker` (state, failures, lastSuccessAt, lastFailureAt) and `lastSuccessAt`.",
+                },
+                horizon: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Includes `breaker` for the stellar-horizon circuit, or null if none is registered.",
+                },
+                database: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Includes `readOnlyMode`; the write check is skipped while it is true.",
+                },
+                queue: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Non-critical. Includes `depth`, `active`, `deadLetter` and `threshold`.",
+                },
+              },
+            },
+            failing: { type: "array", items: { type: "string" }, description: "Critical dependencies that failed" },
+            degraded: { type: "array", items: { type: "string" }, description: "Dependencies that are degraded, or non-critical and failing" },
+            services: {
+              type: "object",
+              description: "Legacy summary, kept for backward compatibility.",
+              properties: {
+                venice: { type: "string", enum: ["ok", "unreachable"] },
+                horizon: { type: "string", enum: ["ok", "unreachable"] },
+              },
+            },
+            venice: { type: "string", enum: ["ok", "unreachable"], description: "Legacy alias of services.venice" },
+            horizon: { type: "string", enum: ["ok", "unreachable"], description: "Legacy alias of services.horizon" },
           },
         },
         ReadinessStatus: {
@@ -337,6 +439,79 @@ List endpoints support standardized query parameters:
               properties: {
                 tasks: { type: "string", enum: ["ok", "error"], example: "ok" },
                 payments: { type: "string", enum: ["ok", "error"], example: "ok" },
+              },
+            },
+          },
+        },
+        MigrationStatus: {
+          type: "object",
+          required: [
+            "database",
+            "migrationsDir",
+            "migrations",
+            "currentVersion",
+            "latestVersion",
+            "appliedCount",
+            "pendingCount",
+            "upToDate",
+            "drift",
+          ],
+          properties: {
+            database: { type: "string", example: "/srv/ai-net/data/ai-net.db" },
+            migrationsDir: { type: "string", example: "/srv/ai-net/backend/src/db/migrations" },
+            migrationCount: { type: "integer", example: 2 },
+            currentVersion: {
+              type: "string",
+              nullable: true,
+              description: "Highest applied migration version, or null when nothing has been applied.",
+              example: "0002",
+            },
+            latestVersion: {
+              type: "string",
+              nullable: true,
+              description: "Highest version present on disk, or null when there are no migration files.",
+              example: "0002",
+            },
+            appliedCount: { type: "integer", example: 2 },
+            pendingCount: { type: "integer", example: 0 },
+            upToDate: {
+              type: "boolean",
+              description: "True when nothing is pending and no applied migration has drifted.",
+              example: true,
+            },
+            drift: {
+              type: "array",
+              description: "Applied migrations that were edited after being applied, or are missing from disk.",
+              items: { type: "string", example: "0001" },
+            },
+            migrations: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["id", "filename", "name", "state", "checksum", "reversible", "drifted"],
+                properties: {
+                  id: { type: "string", example: "0001" },
+                  filename: { type: "string", example: "0001_init.sql" },
+                  name: { type: "string", example: "init" },
+                  state: { type: "string", enum: ["applied", "pending"], example: "applied" },
+                  checksum: { type: "string", example: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" },
+                  appliedAt: {
+                    type: "string",
+                    format: "date-time",
+                    nullable: true,
+                    example: "2026-08-25T17:20:00.000Z",
+                  },
+                  reversible: {
+                    type: "boolean",
+                    description: "True when the file defines a down section.",
+                    example: true,
+                  },
+                  drifted: {
+                    type: "boolean",
+                    description: "True when the recorded checksum differs from the file on disk.",
+                    example: false,
+                  },
+                },
               },
             },
           },
@@ -398,6 +573,26 @@ List endpoints support standardized query parameters:
             error: { type: "string", nullable: true },
             createdAt: { type: "string", format: "date-time" },
             updatedAt: { type: "string", format: "date-time" },
+          },
+        },
+        // Operator-facing dead-letter triage shape (issue #802).
+        DeadLetterEntry: {
+          type: "object",
+          required: ["jobId", "taskId", "failureReason", "failedAt", "retryCount"],
+          properties: {
+            jobId: { type: "string", example: "job_98fe76dc54ba" },
+            taskId: { type: "string", example: "task_ab12cd34ef56" },
+            failureReason: {
+              type: "string",
+              example: "max attempts exceeded (3/3): upstream timeout",
+            },
+            failedAt: { type: "string", format: "date-time" },
+            retryCount: { type: "integer", example: 3 },
+            originalPayload: {
+              type: "object",
+              description: "Payload the job was originally enqueued with, for triage.",
+              additionalProperties: true,
+            },
           },
         },
         QueueStatusResponse: {
@@ -635,6 +830,61 @@ List endpoints support standardized query parameters:
             },
           },
         },
+        ReconciliationDrift: {
+          type: "object",
+          description: "A payment drift awaiting manual operator review (Issue #495).",
+          required: [
+            "id",
+            "driftType",
+            "balanceId",
+            "description",
+            "severity",
+            "recommendedAction",
+            "detectedAt",
+            "lastSeenAt",
+            "occurrences",
+            "acknowledged",
+          ],
+          properties: {
+            id: { type: "string", example: "task_ab12cd34ef56:node_research_1" },
+            driftType: {
+              type: "string",
+              enum: [
+                "orphaned_locked",
+                "missing_release_tx",
+                "release_unconfirmed",
+                "expired_escrow",
+                "missing_local",
+                "amount_mismatch",
+              ],
+              example: "orphaned_locked",
+            },
+            balanceId: { type: "string", example: "00000000abc123..." },
+            taskId: { type: "string", example: "task_ab12cd34ef56" },
+            nodeId: { type: "string", example: "node_research_1" },
+            description: { type: "string", example: "DB says locked but no on-chain claimable balance exists" },
+            severity: { type: "string", enum: ["info", "warning", "critical"], example: "warning" },
+            recommendedAction: {
+              type: "string",
+              enum: ["mark_orphaned", "backfill_tx_hash", "requeue_release", "refund_escrow", "manual_review"],
+              example: "mark_orphaned",
+            },
+            detectedAt: { type: "string", format: "date-time", example: "2026-08-25T17:40:00.000Z" },
+            lastSeenAt: { type: "string", format: "date-time", example: "2026-08-25T18:40:00.000Z" },
+            occurrences: { type: "integer", example: 3 },
+            acknowledged: { type: "boolean", example: false },
+            resolution: {
+              type: "object",
+              description: "Operator resolution patch applied to the payment record.",
+              properties: {
+                status: { type: "string", enum: ["released", "refunded", "orphaned"], example: "released" },
+                txHash: { type: "string", example: "abc123def456..." },
+                at: { type: "string", format: "date-time", example: "2026-08-25T19:00:00.000Z" },
+                by: { type: "string", example: "operator" },
+              },
+            },
+          },
+        },
         Error: {
           type: "object",
           description: "Generic error envelope used where a specific error schema does not apply.",
@@ -690,7 +940,55 @@ List endpoints support standardized query parameters:
   ],
 };
 
-export const openapiSpec: Record<string, any> = swaggerJsdoc(openapiOptions);
+const HTTP_METHODS = ["get", "put", "post", "delete", "patch", "head", "options"] as const;
+
+/**
+ * Fresh objects on every call: sharing one instance across operations makes
+ * `YAML.stringify` emit anchors/aliases, which bloats /openapi.yaml and trips
+ * the parser's alias-count guard.
+ */
+const rateLimitHeaderRefs = (): Record<string, { $ref: string }> => ({
+  "X-RateLimit-Limit": { $ref: "#/components/headers/X-RateLimit-Limit" },
+  "X-RateLimit-Remaining": { $ref: "#/components/headers/X-RateLimit-Remaining" },
+  "X-RateLimit-Reset": { $ref: "#/components/headers/X-RateLimit-Reset" },
+});
+
+/**
+ * Every HTTP route sits behind at least one limiter (the app-wide limiter plus
+ * the public / authed / admin group limiters), so rather than repeating the
+ * header block in each JSDoc annotation the spec is decorated once here:
+ *  - every response advertises the `X-RateLimit-*` headers; and
+ *  - every operation documents a `429` carrying `Retry-After`, reusing
+ *    `#/components/responses/TooManyRequests` when the route has none.
+ */
+export function withRateLimitHeaders(spec: Record<string, any>): Record<string, any> {
+  for (const pathItem of Object.values<any>(spec.paths ?? {})) {
+    for (const method of HTTP_METHODS) {
+      const operation = pathItem?.[method];
+      if (!operation) continue;
+      operation.responses ??= {};
+
+      for (const [status, response] of Object.entries<any>(operation.responses)) {
+        if (status === "429" || response?.$ref) continue;
+        response.headers = { ...rateLimitHeaderRefs(), ...response.headers };
+      }
+
+      const tooMany = operation.responses["429"];
+      if (!tooMany) {
+        operation.responses["429"] = { $ref: "#/components/responses/TooManyRequests" };
+      } else if (!tooMany.$ref) {
+        tooMany.headers = {
+          "Retry-After": { $ref: "#/components/headers/Retry-After" },
+          ...rateLimitHeaderRefs(),
+          ...tooMany.headers,
+        };
+      }
+    }
+  }
+  return spec;
+}
+
+export const openapiSpec: Record<string, any> = withRateLimitHeaders(swaggerJsdoc(openapiOptions));
 
 /**
  * Swagger UI interactive options enabling "Try it out" by default,

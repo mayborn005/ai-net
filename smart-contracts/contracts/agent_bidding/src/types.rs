@@ -65,6 +65,14 @@ pub const MAX_PHASE_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 /// ledger close times, so it would function as a censorship tool.
 pub const MIN_PHASE_DURATION_SECS: u64 = 60;
 
+/// A bid submitted in the final five minutes extends the bidding window.
+pub const ANTI_SNIPE_WINDOW_SECS: u64 = 5 * 60;
+
+/// Extension applied by an eligible late bid. The reveal window moves with
+/// the bidding deadline so late bidders do not reduce the time available to
+/// reveal a commitment.
+pub const ANTI_SNIPE_EXTENSION_SECS: u64 = 5 * 60;
+
 /// Maximum allowed reputation score (percentage scale).
 pub const MAX_REPUTATION: u32 = 100;
 
@@ -252,6 +260,8 @@ pub enum DataKey {
     Paused,
     /// Current semantic contract version.
     Version,
+    /// Optional emergency pause administrator (may pause, never unpause).
+    PauseAdmin,
     /// Stores the root [`Auction`] record for a task.
     Auction(Symbol),
     /// Stores a single [`SealedBid`] for a given (task, bidder) pair.
@@ -262,6 +272,12 @@ pub enum DataKey {
     Winner(Symbol),
     /// Stores the [`Escrow`] record for a task after `award_contract`.
     Escrow(Symbol),
+    /// Stellar Asset Contract address used for bonds, budgets and escrow.
+    PaymentAsset,
+    /// Decimals of the configured payment asset.
+    AssetDecimals,
+    /// Agent Registry contract used for eligibility checks (optional).
+    AgentRegistry,
 }
 
 // ─── Event Payloads ──────────────────────────────────────────────────────────
@@ -350,6 +366,17 @@ pub struct RefundClaimedEvent {
 }
 
 pub type BondRefundClaimedEvent = RefundClaimedEvent;
+
+/// Emitted when escrowed funds are transferred out, either to the winning
+/// agent (`release_escrow`) or back to the creator (`refund_escrow`).
+/// `amount` is the number of asset units actually transferred.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowSettledEvent {
+    pub task_id: Symbol,
+    pub recipient: Address,
+    pub amount: i128,
+}
 
 // ─── Bond lifecycle events (issue #486) ─────────────────────────────────────
 

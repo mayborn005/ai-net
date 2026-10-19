@@ -67,6 +67,22 @@ Measured examples: listing 75,390 CU, booking 73,021 CU, searching one listing
 Measured examples: create 88,859 CU, update 104,078 CU, one task query 53,604 CU,
 and a two-task batch query 90,137 CU.
 
+## Token Transfers (escrow)
+
+`agent_marketplace` (`book_agent`, `complete_booking`, `cancel_booking`) and
+`agent_bidding` (`create_auction`, `submit_bid`, `award_contract`,
+`abort_auction`, `claim_refund`, `claim_bid_refund`, `release_escrow`,
+`refund_escrow`) now perform cross-contract Stellar Asset Contract calls: one
+`decimals()` check plus one `transfer` per moved amount. `award_contract` and
+`abort_auction` transfer once per bidder (bounded by `MAX_BIDDERS`) plus once
+to the creator.
+
+The per-operation figures in the tables above predate these transfers and
+**understate** the affected operations. They must be re-measured with
+`cargo test -p agent-marketplace -p agent-bidding` against the
+`Env::cost_estimate()` budget and the `gas.rs` constants updated; until then,
+always use transaction simulation for these calls.
+
 ## Runtime Budget Guard
 
 Soroban SDK 22 exposes budget consumption through test utilities, not to
@@ -75,3 +91,69 @@ with `Env`; the network validates the transaction's declared resource limits.
 The estimate entry points let callers estimate before submission, while a
 contract-side `require_gas_budget(minimum)` cannot truthfully check remaining
 budget in this SDK version.
+
+## Snapshot gas regression baselines (Issue #773)
+
+The estimates above are human-maintained. They are complemented by machine
+snapshots that fail a PR when a hot entrypoint gets measurably more expensive,
+even if every functional test still passes.
+
+### Layout
+
+| Path | Purpose |
+|---|---|
+| `contracts/*/tests/gas_snapshot.rs` | Fixed-input measurements per entrypoint |
+| `gas-baselines.json` | Committed instructions / memory bytes per `contract::entrypoint` |
+| `test-utils/src/gas.rs` | Measurement + diff + update helper (`contract_test_utils::gas`) |
+
+Covered entrypoints:
+
+- **agent_registry** — `register_agent`, `register_agents` (batch of 2), `lookup_agents`
+- **agent_bidding** — `create_auction`, `submit_bid`, `reveal_bid`
+- **agent_marketplace** — `list_service`, `book_agent`, `complete_booking`
+- **task_store** — `store_task_metadata`, `get_task_metadata`, `update_task_status`, `create_task`
+
+Each test calls `gas::reset(&env)` immediately before the entrypoint and
+`gas::assert_snapshot(&env, contract, entrypoint)` immediately after. Setup
+(initialising contracts, funding accounts, listing services) happens before the
+reset and is not measured.
+
+### Determinism
+
+Inputs are fixed and `Env::default()` seeds its PRNG with a zero base seed, so
+addresses and commitments are identical on every machine. The measurement is
+the host's metered `cpu_instruction_cost()` / `memory_bytes_cost()`, not wall
+clock. Native numbers are lower than Wasm numbers but are compared only against
+native baselines from the same `soroban-sdk` pin.
+
+### Updating intentionally
+
+```bash
+cd smart-contracts
+
+# Re-record every covered entrypoint
+UPDATE_GAS_BASELINES=1 cargo test -p agent_registry -p agent-bidding \
+  -p agent-marketplace -p task-store --test gas_snapshot
+
+# Or one contract
+UPDATE_GAS_BASELINES=1 cargo test -p task-store --test gas_snapshot
+```
+
+Review the JSON diff and explain the increase in the PR description. Do not
+commit a new baseline to make a red check go away without an explanation — the
+point of the file is to make the cost change visible.
+
+The default tolerance is **5%** and is stored in `gas-baselines.json`. CI can
+loosen it per-run with `GAS_SNAPSHOT_TOLERANCE_PCT`, but a per-run override is
+not a substitute for an intentional baseline update.
+
+Regressions print both dimensions:
+
+```text
+gas regression in `agent_registry::register_agent` (tolerance 5%):
+  instructions: 100000 -> 211801 (+111.8%)
+  memory:       33988 -> 33988 bytes (+0.0%)
+```
+
+The snapshots run as part of the normal `cargo test` invocation used by CI; no
+separate workflow step is required.

@@ -35,7 +35,10 @@ USER appuser
 
 EXPOSE 3000
 
+# Liveness only: /health/live never touches upstreams, so a Venice or Horizon
+# outage cannot flap the container. Gate traffic on /health/deep instead (503
+# when a critical dependency is failing) — see docs/API_REFERENCE.md.
 HEALTHCHECK --interval=5s --timeout=3s --retries=5 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health/live || exit 1
 
 CMD ["node", "dist/src/index.js"]

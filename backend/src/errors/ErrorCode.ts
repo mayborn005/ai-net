@@ -18,8 +18,22 @@ export const ErrorCode = {
   UNAUTHORIZED: "UNAUTHORIZED",
   FORBIDDEN: "FORBIDDEN",
 
+  // ── Agent ownership proof (#557, #558) ─────────────────────────────────────
+  /**
+   * The server-issued challenge is missing, unknown, expired, already used, or
+   * was issued for a different request. Recoverable: request a new challenge.
+   */
+  AGENT_CHALLENGE_INVALID: "AGENT_CHALLENGE_INVALID",
+  /**
+   * The signature is absent, malformed, or does not verify against the claimed
+   * Stellar public key. Not recoverable by retrying with the same key.
+   */
+  AGENT_SIGNATURE_INVALID: "AGENT_SIGNATURE_INVALID",
+
   // ── Rate limiting ──────────────────────────────────────────────────────────
   RATE_LIMITED: "RATE_LIMITED",
+  /** A per-wallet daily quota (tasks or Venice tokens) is exhausted (#803). */
+  QUOTA_EXCEEDED: "QUOTA_EXCEEDED",
 
   // ── Payment / Stellar ─────────────────────────────────────────────────────
   PAYMENT_ERROR: "PAYMENT_ERROR",
@@ -50,7 +64,10 @@ export const HTTP_STATUS_FOR_CODE: Record<ErrorCode, number> = {
   CONFLICT: 409,
   UNAUTHORIZED: 401,
   FORBIDDEN: 403,
+  AGENT_CHALLENGE_INVALID: 401,
+  AGENT_SIGNATURE_INVALID: 401,
   RATE_LIMITED: 429,
+  QUOTA_EXCEEDED: 429,
   PAYMENT_ERROR: 402,
   STELLAR_UNAVAILABLE: 503,
   UPSTREAM_UNAVAILABLE: 502,
@@ -72,7 +89,10 @@ export const DEFAULT_MESSAGE_FOR_CODE: Record<ErrorCode, string> = {
   CONFLICT: "The request conflicts with the current state of the resource.",
   UNAUTHORIZED: "Authentication required.",
   FORBIDDEN: "You do not have permission to perform this action.",
+  AGENT_CHALLENGE_INVALID: "The agent challenge is missing, expired, or was issued for another request.",
+  AGENT_SIGNATURE_INVALID: "The agent signature does not match the claimed Stellar public key.",
   RATE_LIMITED: "Too many requests. Please slow down.",
+  QUOTA_EXCEEDED: "The daily quota for this wallet has been exhausted. Please try again after the quota resets.",
   PAYMENT_ERROR: "Payment operation failed.",
   STELLAR_UNAVAILABLE: "Stellar network unavailable.",
   UPSTREAM_UNAVAILABLE: "An upstream service is unavailable.",

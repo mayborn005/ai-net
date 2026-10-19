@@ -53,7 +53,7 @@ use events::{
     MinBondSetEvent, MultisigConfigSetEvent, MultisigConfigUpdatedEvent, OperationApproved,
     OperationCancelled, OperationExecuted, OperationProposed, RegistryInitializedEvent,
     ReputationDecayed, ReputationUpdated, SlaBonusAwardedEvent, SlaSetEvent,
-    SlaViolationDetectedEvent,
+    SlaViolationDetectedEvent, StorageConfigSetEvent,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Map, String, Symbol,
@@ -318,10 +318,17 @@ pub enum DataKey {
     // Reputation keys (issue #244)
     /// Coordinator worker authorized to post reputation updates (admin fallback).
     Coordinator,
+    AuthorizedCallers,
+    TaskOutcome(Symbol),
     /// Stored reputation record for one agent.
     Reputation(Symbol),
     /// Tunable decay schedule (instance storage).
     ReputationConfig,
+    // Agent capability versioning keys (issue #243)
+    /// One versioned record keyed by (agent_id, major, minor, patch).
+    AgentVersionRecord(Symbol, u32, u32, u32),
+    /// Ordered list of version tuples for an agent, stored as Vec<(u32,u32,u32)>.
+    AgentVersionIndex(Symbol),
 }
 
 /// Per-item result for batch registration.
@@ -563,7 +570,7 @@ fn internal_slash_bond(
         } else {
             bond::BondStatus::Active
         };
-        env.storage().persistent().set(&bond_key, &bond_record);
+        env.storage().persistent().set(&bond_key, bond_record);
         extend_ttl_for_existing_key(env, &bond_key);
     }
     if actual_penalty > 0 && remaining < min_bond(env) {
@@ -1240,6 +1247,39 @@ impl AgentRegistryContract {
             .persistent()
             .get(&DataKey::FrozenAgent(agent_id))
             .unwrap_or(false)
+    }
+
+    /// Cross-contract eligibility check helper.
+    ///
+    /// Verifies that `agent_id` refers to a registered, unfrozen, solvent agent.
+    pub fn verify_agent_eligible(env: Env, agent_id: Symbol) -> Result<(), Error> {
+        let agent_key = DataKey::Agent(agent_id.clone());
+        let record: AgentRecord = match env.storage().persistent().get(&agent_key) {
+            Some(rec) => rec,
+            None => {
+                let cooldown_key = DataKey::BondCooldown(agent_id);
+                if env.storage().persistent().has(&cooldown_key) {
+                    return Err(Error::AgentDeregistered);
+                }
+                return Err(Error::NotFound);
+            }
+        };
+
+        let is_frozen = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::FrozenAgent(agent_id))
+            .unwrap_or(false);
+        if is_frozen {
+            return Err(Error::AgentFrozen);
+        }
+
+        let min_bond = min_bond(&env);
+        if record.bond_amount < min_bond {
+            return Err(Error::InsufficientBond);
+        }
+
+        Ok(())
     }
 
     // ── Agent registration ───────────────────────────────────────────────────
@@ -2038,7 +2078,9 @@ impl AgentRegistryContract {
     /// Admin: configure the dispute-resolution contract allowed to slash bonds.
     pub fn set_dispute_resolver(env: Env, resolver: Address) -> Result<(), Error> {
         let admin = require_admin(&env)?;
-        env.storage().instance().set(&DataKey::DisputeResolver, &resolver);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeResolver, &resolver);
         env.events().publish(
             (symbol_short!("registry"), symbol_short!("dispute")),
             resolver.clone(),
@@ -2388,11 +2430,7 @@ impl AgentRegistryContract {
     }
 
     /// Reserve an agent's bond until its dispute is finally resolved.
-    pub fn lock_bond_for_dispute(
-        env: Env,
-        caller: Address,
-        agent_id: Symbol,
-    ) -> Result<(), Error> {
+    pub fn lock_bond_for_dispute(env: Env, caller: Address, agent_id: Symbol) -> Result<(), Error> {
         require_dispute_resolver(&env, &caller)?;
         let lock_key = DataKey::DisputeBondLock(agent_id.clone());
         if env.storage().persistent().has(&lock_key) {
@@ -3165,6 +3203,138 @@ impl AgentRegistryContract {
         env.storage().instance().get(&DataKey::Coordinator)
     }
 
+    /// Add an outcome reporter. The instance allowlist is deliberately bounded.
+    pub fn add_authorized_caller(env: Env, caller: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+        let mut callers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuthorizedCallers)
+            .unwrap_or(Vec::new(&env));
+        if callers.contains(&caller) {
+            return Err(Error::AlreadyExists);
+        }
+        if callers.len() >= 16 {
+            return Err(Error::InvalidRecord);
+        }
+        callers.push_back(caller.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::AuthorizedCallers, &callers);
+        env.events().publish(
+            (symbol_short!("registry"), symbol_short!("auth_add")),
+            caller,
+        );
+        Ok(())
+    }
+
+    pub fn remove_authorized_caller(env: Env, caller: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+        let callers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuthorizedCallers)
+            .unwrap_or(Vec::new(&env));
+        let mut next = Vec::new(&env);
+        let mut found = false;
+        for authorized in callers.iter() {
+            if authorized == caller {
+                found = true;
+            } else {
+                next.push_back(authorized);
+            }
+        }
+        if !found {
+            return Err(Error::NotFound);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AuthorizedCallers, &next);
+        env.events().publish(
+            (symbol_short!("registry"), symbol_short!("auth_rem")),
+            caller,
+        );
+        Ok(())
+    }
+
+    pub fn is_authorized_caller(env: Env, caller: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::AuthorizedCallers)
+            .map(|callers| callers.contains(&caller))
+            .unwrap_or(false)
+    }
+
+    /// Record an idempotent task outcome. `score_delta` uses the registry's
+    /// fixed-point score units; failed tasks cannot increase the score.
+    pub fn record_task_outcome(
+        env: Env,
+        caller: Address,
+        agent_id: Symbol,
+        success: bool,
+        score_delta: i32,
+        task_id: Symbol,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        caller.require_auth();
+        let callers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuthorizedCallers)
+            .unwrap_or(Vec::new(&env));
+        if !callers.contains(&caller) {
+            return Err(Error::Unauthorized);
+        }
+        let outcome_key = DataKey::TaskOutcome(task_id.clone());
+        if env.storage().persistent().has(&outcome_key) {
+            return Err(Error::AlreadyExists);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Agent(agent_id.clone()))
+        {
+            return Err(Error::NotFound);
+        }
+        let key = DataKey::Reputation(agent_id.clone());
+        let mut reputation: ReputationScore =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(ReputationScore {
+                    agent_id: agent_id.clone(),
+                    score: 0,
+                    last_updated: env.ledger().timestamp(),
+                });
+        let delta = if success {
+            score_delta
+        } else {
+            score_delta.min(0)
+        };
+        reputation.score = if delta >= 0 {
+            reputation
+                .score
+                .saturating_add(delta as u64)
+                .min(REPUTATION_SCALE)
+        } else {
+            reputation.score.saturating_sub(delta.unsigned_abs() as u64)
+        };
+        reputation.last_updated = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &reputation);
+        env.storage().persistent().set(&outcome_key, &true);
+        extend_ttl_for_existing_key(&env, &key);
+        extend_ttl_for_existing_key(&env, &outcome_key);
+        env.events().publish(
+            (symbol_short!("registry"), symbol_short!("rep_upd")),
+            ReputationUpdated {
+                agent_id,
+                score: reputation.score,
+                updated_at: reputation.last_updated,
+            },
+        );
+        Ok(())
+    }
+
     /// Update the decay schedule. `epoch_secs` must be > 0 and
     /// `decay_pct` must be ≤ 100; anything else is `InvalidConfig`.
     pub fn set_reputation_config(env: Env, decay_pct: u32, epoch_secs: u64) -> Result<(), Error> {
@@ -3515,6 +3685,291 @@ impl AgentRegistryContract {
     /// ```
     pub fn error_mapper(_env: Env, raw_code: u32) -> Option<CommonExitCode> {
         shared_exit_codes::CommonExitCode::from_raw(raw_code)
+    }
+
+    // ─── Agent Capability Versioning (issue #243) ────────────────────────────
+
+    /// Parse a semver string `"major.minor.patch"` into an [`AgentVersion`].
+    ///
+    /// Returns `Err(Error::InvalidVersion)` if the string is not exactly three
+    /// dot-separated non-negative integers.
+    fn parse_version(_env: &Env, version_str: &soroban_sdk::String) -> Result<AgentVersion, Error> {
+        let len = version_str.len();
+        // Minimum: "0.0.0" = 5 chars; maximum: guard against runaway input.
+        if len < 5 || len > 32 {
+            return Err(Error::InvalidVersion);
+        }
+
+        let mut parts: [u32; 3] = [0, 0, 0];
+        let mut part_idx: usize = 0;
+        let mut digit_seen = false;
+
+        // Copy into a fixed-size on-stack buffer to avoid Bytes allocation.
+        let mut buf = [0u8; 32];
+        version_str.copy_into_slice(&mut buf[..len as usize]);
+
+        let mut i: usize = 0;
+        while i < len as usize {
+            let b = buf[i];
+            i += 1;
+            if b == b'.' {
+                if !digit_seen || part_idx >= 2 {
+                    return Err(Error::InvalidVersion);
+                }
+                part_idx += 1;
+                digit_seen = false;
+            } else if b >= b'0' && b <= b'9' {
+                let digit = (b - b'0') as u32;
+                parts[part_idx] = parts[part_idx]
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(digit))
+                    .ok_or(Error::InvalidVersion)?;
+                digit_seen = true;
+            } else {
+                return Err(Error::InvalidVersion);
+            }
+        }
+
+        if part_idx != 2 || !digit_seen {
+            return Err(Error::InvalidVersion);
+        }
+
+        Ok(AgentVersion {
+            major: parts[0],
+            minor: parts[1],
+            patch: parts[2],
+        })
+    }
+
+    /// Compare two [`AgentVersion`]s: returns `true` when `a < b`.
+    fn version_lt(a: &AgentVersion, b: &AgentVersion) -> bool {
+        if a.major != b.major {
+            return a.major < b.major;
+        }
+        if a.minor != b.minor {
+            return a.minor < b.minor;
+        }
+        a.patch < b.patch
+    }
+
+    /// Publish a new capability version for an existing registered agent.
+    ///
+    /// - `version_str` must be `"major.minor.patch"` semver.
+    /// - The new version must be strictly greater than any previously published
+    ///   version (prevents version rollback).
+    /// - The previous latest version (if any) is marked `superseded = true` and
+    ///   an [`AgentVersionSupersededEvent`] is emitted for it.
+    /// - An [`AgentVersionPublishedEvent`] is emitted for the new version.
+    ///
+    /// The base `AgentRecord` must already exist (registered via
+    /// `register_agent`).  This function does **not** modify the base record —
+    /// it creates a parallel versioned history.
+    pub fn register_agent_version(
+        env: Env,
+        record: AgentRecord,
+        version_str: soroban_sdk::String,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_not_frozen(&env, &record.id)?;
+
+        record.owner.require_auth();
+        validate_record(&env, &record)?;
+
+        // Base agent must already be registered.
+        let agent_key = DataKey::Agent(record.id.clone());
+        if !env.storage().persistent().has(&agent_key) {
+            return Err(Error::NotFound);
+        }
+
+        let new_ver = Self::parse_version(&env, &version_str)?;
+
+        let idx_key = DataKey::AgentVersionIndex(record.id.clone());
+        let mut index: Vec<(u32, u32, u32)> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Ensure the new version is strictly greater than all existing ones.
+        for i in 0..index.len() {
+            let (maj, min, pat) = index.get(i).unwrap();
+            let existing = AgentVersion {
+                major: maj,
+                minor: min,
+                patch: pat,
+            };
+            if !Self::version_lt(&existing, &new_ver) {
+                // new_ver <= existing — reject to prevent rollback / duplicate.
+                return Err(Error::AlreadyExists);
+            }
+        }
+
+        // Mark the current latest version as superseded.
+        if let Some((prev_maj, prev_min, prev_pat)) = index.last() {
+            let prev_key =
+                DataKey::AgentVersionRecord(record.id.clone(), prev_maj, prev_min, prev_pat);
+            if let Some(mut prev_versioned) = env
+                .storage()
+                .persistent()
+                .get::<_, VersionedAgentRecord>(&prev_key)
+            {
+                prev_versioned.superseded = true;
+                env.storage().persistent().set(&prev_key, &prev_versioned);
+                extend_ttl_for_existing_key(&env, &prev_key);
+
+                env.events().publish(
+                    (symbol_short!("registry"), symbol_short!("ver_sup")),
+                    events::AgentVersionSupersededEvent {
+                        agent_id: record.id.clone(),
+                        major: prev_maj,
+                        minor: prev_min,
+                        patch: prev_pat,
+                    },
+                );
+            }
+        }
+
+        // Store the new versioned record.
+        let versioned = VersionedAgentRecord {
+            record: record.clone(),
+            version: new_ver.clone(),
+            superseded: false,
+            published_at: env.ledger().timestamp(),
+        };
+        let ver_key = DataKey::AgentVersionRecord(
+            record.id.clone(),
+            new_ver.major,
+            new_ver.minor,
+            new_ver.patch,
+        );
+        env.storage().persistent().set(&ver_key, &versioned);
+        extend_ttl_for_existing_key(&env, &ver_key);
+
+        // Append to the index.
+        index.push_back((new_ver.major, new_ver.minor, new_ver.patch));
+        env.storage().persistent().set(&idx_key, &index);
+        extend_ttl_for_existing_key(&env, &idx_key);
+
+        env.events().publish(
+            (symbol_short!("registry"), symbol_short!("ver_pub")),
+            events::AgentVersionPublishedEvent {
+                agent_id: record.id.clone(),
+                owner: record.owner.clone(),
+                major: new_ver.major,
+                minor: new_ver.minor,
+                patch: new_ver.patch,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Return all published versions for `agent_id`, oldest-first.
+    ///
+    /// Returns `Err(Error::NoVersionsFound)` when no versions have been
+    /// registered via `register_agent_version`.
+    pub fn get_agent_versions(env: Env, agent_id: Symbol) -> Result<AgentVersionPage, Error> {
+        let idx_key = DataKey::AgentVersionIndex(agent_id.clone());
+        let index: Vec<(u32, u32, u32)> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if index.is_empty() {
+            return Err(Error::NoVersionsFound);
+        }
+
+        let mut versions: Vec<VersionedAgentRecord> = Vec::new(&env);
+        let mut ttl_keys: Vec<DataKey> = Vec::new(&env);
+
+        for i in 0..index.len() {
+            let (maj, min, pat) = index.get(i).unwrap();
+            let ver_key = DataKey::AgentVersionRecord(agent_id.clone(), maj, min, pat);
+            if let Some(v) = env
+                .storage()
+                .persistent()
+                .get::<_, VersionedAgentRecord>(&ver_key)
+            {
+                ttl_keys.push_back(ver_key);
+                versions.push_back(v);
+            }
+        }
+
+        extend_ttl_batch_existing(&env, &ttl_keys);
+
+        Ok(AgentVersionPage { versions })
+    }
+
+    /// Look up agents by capability with an optional version constraint.
+    ///
+    /// When `version_constraint` is `None` this behaves identically to
+    /// `lookup_agents`.  When a constraint is provided only the latest
+    /// non-superseded version of each agent that satisfies
+    /// `agent_version >= constraint` is included.
+    pub fn lookup_agents_versioned(
+        env: Env,
+        capability: Symbol,
+        version_constraint: Option<AgentVersion>,
+    ) -> Vec<AgentRecord> {
+        let cap_key = DataKey::CapabilityIndex(capability.clone());
+        let stored_ids: Option<Vec<Symbol>> = env.storage().persistent().get(&cap_key);
+        let ids = stored_ids.clone().unwrap_or_else(|| Vec::new(&env));
+
+        if stored_ids.is_some() {
+            extend_ttl_for_existing_key(&env, &cap_key);
+        }
+
+        let mut ttl_keys: Vec<DataKey> = Vec::new(&env);
+        let mut records: Vec<AgentRecord> = Vec::new(&env);
+
+        for id in ids.iter() {
+            let agent_key = DataKey::Agent(id.clone());
+            if let Some(record) = env.storage().persistent().get::<_, AgentRecord>(&agent_key) {
+                // When no constraint is given, include every agent.
+                let passes = match &version_constraint {
+                    None => true,
+                    Some(constraint) => {
+                        // Find the latest non-superseded version for this agent.
+                        let idx_key = DataKey::AgentVersionIndex(id.clone());
+                        let index: Vec<(u32, u32, u32)> = env
+                            .storage()
+                            .persistent()
+                            .get(&idx_key)
+                            .unwrap_or_else(|| Vec::new(&env));
+
+                        let mut found = false;
+                        // The index is oldest-first; walk backwards for latest.
+                        let mut j = index.len();
+                        while j > 0 {
+                            j -= 1;
+                            let (maj, min, pat) = index.get(j).unwrap();
+                            let ver_key = DataKey::AgentVersionRecord(id.clone(), maj, min, pat);
+                            if let Some(vr) = env
+                                .storage()
+                                .persistent()
+                                .get::<_, VersionedAgentRecord>(&ver_key)
+                            {
+                                if !vr.superseded {
+                                    // Agent passes if its version >= constraint.
+                                    found = !Self::version_lt(&vr.version, constraint);
+                                    break;
+                                }
+                            }
+                        }
+                        found
+                    }
+                };
+
+                if passes {
+                    ttl_keys.push_back(agent_key);
+                    records.push_back(record);
+                }
+            }
+        }
+
+        extend_ttl_batch_existing(&env, &ttl_keys);
+        records
     }
 }
 

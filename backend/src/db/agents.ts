@@ -5,6 +5,7 @@ import { migrateToLatest } from "./migrator";
 import type { ReputationBreakdown } from "../services/qualityScorer.types";
 import { createPool, type SqlitePool } from "./pool";
 import { decodeCursor, encodeCursor, type CursorPage } from "./cursor";
+import { ValidationError } from "../errors";
 import { createErrorRegistryStore, getErrorDb } from "./errorRegistry";
 import { safeJsonArray } from "../utils/safeJson";
 
@@ -71,6 +72,17 @@ export interface AgentAlertRow {
 let _agentPool: SqlitePool | null = null;
 let _agentPoolClosing: Promise<void> | null = null;
 
+/**
+ * Memoised `AgentDb` wrappers, keyed by the underlying SQLite handle.
+ *
+ * `createAgentDb` is called from request handlers (and from background
+ * services) with the pool's writer handle, so without this cache every call
+ * would rebuild the wrapper's closure graph. Keying on the handle keeps the
+ * cache correct when the pool is closed and reopened: a new writer is a new
+ * key, and the stale entry becomes unreachable.
+ */
+const _agentDbCache = new WeakMap<Database.Database, AgentDb>();
+
 export function ensureAgentTable(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
@@ -104,6 +116,7 @@ export function ensureAgentTable(db: Database.Database): void {
       // Ignored if column already exists
     }
   }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agents_listing ON agents (lastSeenAt DESC, id DESC)");
 
   // Mirrors migration 002 so an in-memory test database (which never runs the
   // migrations directory) still has the alert table.
@@ -132,11 +145,18 @@ export function getAgentPool(dbPath?: string): SqlitePool {
     const filePath = dbPath ?? path.join(process.cwd(), "agents.db");
     _agentPool = createPool({
       filePath,
+      name: "agents",
       min: 1,
       max: 4,
       acquireTimeoutMs: 5_000,
+      // Schema setup runs exactly once per pool here, on the writer, before
+      // any reader attaches to the file. It deliberately does not live in
+      // `createAgentDb`: that is a per-request mapping, and running DDL there
+      // meant every agents request opened a write transaction and took the
+      // write lock just to re-discover a schema that already existed.
       onCreate: (db) => {
         migrateToLatest(db, MIGRATIONS_DIR);
+        ensureAgentTable(db);
       },
     });
   }
@@ -171,7 +191,8 @@ export function closeAgentDb(): Promise<void> {
 export interface AgentDb {
   upsert(agent: AgentRecord): void;
   findById(id: string): AgentRecord | undefined;
-  list(filters?: { capability?: string; minReputation?: number; maxPriceXLM?: number; status?: string }): AgentRecord[];
+  /** Bounded convenience wrapper: defaults to 20, at most 100 records. */
+  list(options?: AgentCursorOptions): AgentRecord[];
   /**
    * Cursor-based list — stable under concurrent writes.
    * Keyset: (lastSeenAt DESC, id DESC).
@@ -234,9 +255,22 @@ export interface AgentDb {
   resolveError?(errorId: string, resolution: string): void;
 }
 
+/**
+ * Map an already-initialised SQLite handle onto the `AgentDb` API.
+ *
+ * Pure mapping: no DDL, no other side effects. The agents schema is created
+ * once by `getAgentPool`'s `onCreate` hook when the handle is first opened.
+ *
+ * The result is memoised per handle, so repeated calls return the *same*
+ * object reference rather than a structurally identical copy — callers such as
+ * the agents route's `createAgentDb(getAgentDb())` pay a map lookup instead of
+ * rebuilding the wrapper and discarding its prepared-statement cache.
+ */
 export function createAgentDb(db: Database.Database): AgentDb {
-  ensureAgentTable(db);
-  return {
+  const cached = _agentDbCache.get(db);
+  if (cached) return cached;
+
+  const agentDb: AgentDb = {
     upsert(agent: AgentRecord): void {
       const rep = agent.reputationScore !== undefined ? Math.max(0.0, Math.min(5.0, agent.reputationScore)) : 2.5;
       db.prepare(`
@@ -280,48 +314,15 @@ export function createAgentDb(db: Database.Database): AgentDb {
       };
     },
 
-    list(filters?: { capability?: string; minReputation?: number; maxPriceXLM?: number; status?: string }): AgentRecord[] {
-      let query = "SELECT * FROM agents WHERE 1=1";
-      const params: any[] = [];
-      
-      if (filters?.minReputation !== undefined) {
-        query += " AND reputationScore >= ?";
-        params.push(filters.minReputation);
-      }
-      if (filters?.maxPriceXLM !== undefined) {
-        query += " AND pricingXLM <= ?";
-        params.push(filters.maxPriceXLM);
-      }
-      if (filters?.capability !== undefined) {
-        // Rows whose `capabilities` column is not valid JSON are skipped
-        // instead of aborting the whole query (#645). `json_each` is handed a
-        // sanitized document so even an eager planner cannot reach the bad
-        // value.
-        query +=
-          " AND json_valid(capabilities)" +
-          " AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(capabilities) THEN capabilities ELSE '[]' END) WHERE value = ?)";
-        params.push(filters.capability);
-      }
-      if (filters?.status !== undefined) {
-        query += " AND status = ?";
-        params.push(filters.status);
-      }
-
-      const rows = db.prepare(query).all(...params) as any[];
-      return rows.map(row => ({
-        ...row,
-        capabilities: safeJsonArray(row.capabilities, "agents.list", row.id),
-        status: row.status ?? 'offline',
-        reputationScore: Number(row.reputationScore ?? 2.5),
-        bondAmountXLM: Number(row.bondAmountXLM ?? 0),
-        tasksCompleted: Number(row.tasksCompleted ?? 0),
-        tasksFailed: Number(row.tasksFailed ?? 0),
-        lastActiveAt: row.lastActiveAt ?? row.lastSeenAt,
-      }));
+    list(options: AgentCursorOptions = {}): AgentRecord[] {
+      return this.listCursor(options).items;
     },
 
     listCursor(options: AgentCursorOptions = {}): CursorPage<AgentRecord> {
-      const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
+      const limit = options.limit ?? 20;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        throw new ValidationError("limit must be an integer between 1 and 100");
+      }
 
       const conditions: string[] = ["1=1"];
       const params: unknown[] = [];
@@ -352,25 +353,29 @@ export function createAgentDb(db: Database.Database): AgentDb {
       let cursorCondition = "";
       const cursorParams: unknown[] = [];
 
-      if (options.cursor) {
+      if (options.cursor !== undefined) {
         const payload = decodeCursor(options.cursor);
-        if (payload?.lastSeenAt && payload?.id) {
-          // Compound keyset: rows that come after (lastSeenAt DESC, id DESC)
-          cursorCondition = "AND (lastSeenAt < ? OR (lastSeenAt = ? AND id < ?))";
-          cursorParams.push(payload.lastSeenAt, payload.lastSeenAt, payload.id);
+        if (!payload || typeof payload.lastSeenAt !== "string" || !payload.lastSeenAt ||
+            typeof payload.id !== "string" || !payload.id) {
+          throw new ValidationError("Invalid agent cursor");
         }
+        // Compound keyset: rows that come after (lastSeenAt DESC, id DESC)
+        cursorCondition = "AND (lastSeenAt < ? OR (lastSeenAt = ? AND id < ?))";
+        cursorParams.push(payload.lastSeenAt, payload.lastSeenAt, payload.id);
       }
 
       const whereClause = conditions.join(" AND ");
       // Fetch limit+1 to detect whether a next page exists without a COUNT query
       const rows = db
         .prepare(
-          `SELECT * FROM agents
+          `SELECT id, capabilities, pricingXLM, endpoint, stellarPublicKey,
+                  reputationScore, lastSeenAt, status, bondAmountXLM,
+                  tasksCompleted, tasksFailed, lastActiveAt FROM agents
            WHERE ${whereClause} ${cursorCondition}
            ORDER BY lastSeenAt DESC, id DESC
            LIMIT ?`,
         )
-        .all(...params, ...cursorParams, limit + 1) as any[];
+        .all(...params, ...cursorParams, limit + 1) as Array<Omit<AgentRecord, "capabilities"> & { capabilities: string }>;
 
       const hasMore = rows.length > limit;
       const pageRows = hasMore ? rows.slice(0, limit) : rows;
@@ -379,6 +384,11 @@ export function createAgentDb(db: Database.Database): AgentDb {
         ...row,
         capabilities: safeJsonArray(row.capabilities, "agents.listCursor", row.id),
         status: row.status ?? 'offline',
+        reputationScore: Number(row.reputationScore ?? 2.5),
+        bondAmountXLM: Number(row.bondAmountXLM ?? 0),
+        tasksCompleted: Number(row.tasksCompleted ?? 0),
+        tasksFailed: Number(row.tasksFailed ?? 0),
+        lastActiveAt: row.lastActiveAt ?? row.lastSeenAt,
       }));
 
       const result: CursorPage<AgentRecord> = { items: agents };
@@ -608,4 +618,7 @@ export function createAgentDb(db: Database.Database): AgentDb {
       store.resolve(errorId, resolution);
     }
   };
+
+  _agentDbCache.set(db, agentDb);
+  return agentDb;
 }

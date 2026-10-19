@@ -11,6 +11,7 @@ class MockWebSocket {
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
   readyState: number = WebSocket.CONNECTING;
+  sent: string[] = [];
 
   constructor(public url: string) {
     MockWebSocket.instance = this;
@@ -23,8 +24,8 @@ class MockWebSocket {
     }
   }
 
-  send(_data: string) {
-    // Mock implementation
+  send(data: string) {
+    this.sent.push(data);
   }
 
   // Test helpers
@@ -61,6 +62,7 @@ class MockWebSocket {
 describe('useTaskWebSocket', () => {
   beforeEach(() => {
     MockWebSocket.instance = null;
+    sessionStorage.clear();
     vi.clearAllTimers();
     vi.useFakeTimers();
   });
@@ -81,7 +83,8 @@ describe('useTaskWebSocket', () => {
     expect(result.current.isConnected).toBe(false);
     expect(result.current.status).toBe('connecting');
     expect(MockWebSocket.instance).toBeTruthy();
-    expect(MockWebSocket.instance!.url).toBe('ws://localhost:3001/tasks/test-task/stream');
+    // Same-origin base + /api/tasks prefix (see getDefaultWsBaseUrl).
+    expect(MockWebSocket.instance!.url).toContain('/api/tasks/test-task/stream');
   });
 
   it('should set connected status when WebSocket opens', () => {
@@ -100,6 +103,44 @@ describe('useTaskWebSocket', () => {
     expect(result.current.isConnected).toBe(true);
     expect(result.current.status).toBe('connected');
     expect(mockOptions.onConnect).toHaveBeenCalled();
+  });
+
+  it('does not send auth on open; answers the server auth_challenge instead', async () => {
+    const signChallenge = vi.fn(async (nonce: string) => `sig-for-${nonce}`);
+    renderHook(() =>
+      useTaskWebSocket({
+        taskId: 'owned-task',
+        walletPublicKey: 'GOWNER',
+        signChallenge,
+        onMessage: vi.fn(),
+      })
+    );
+
+    act(() => MockWebSocket.instance!.simulateOpen());
+
+    // Challenge-response: nothing is sent until the server issues a nonce.
+    expect(MockWebSocket.instance!.sent).toHaveLength(0);
+
+    act(() => MockWebSocket.instance!.simulateMessage({ type: 'auth_challenge', nonce: 'n-1' }));
+    await act(async () => {});
+
+    expect(signChallenge).toHaveBeenCalledWith('n-1');
+    expect(MockWebSocket.instance!.sent[0]).toBe(
+      JSON.stringify({ walletPublicKey: 'GOWNER', nonce: 'n-1', signature: 'sig-for-n-1' })
+    );
+  });
+
+  it('does not open an authenticated stream without a wallet and reports the requirement', () => {
+    const { result } = renderHook(() =>
+      useTaskWebSocket({
+        taskId: 'owned-task',
+        requireAuthentication: true,
+        onMessage: vi.fn(),
+      })
+    );
+
+    expect(MockWebSocket.instance).toBeNull();
+    expect(result.current.status).toBe('authentication-required');
   });
 
   it('should handle incoming messages', () => {
@@ -283,5 +324,52 @@ describe('useTaskWebSocket', () => {
     act(() => MockWebSocket.instance!.simulateOpen());
     expect(result.current.status).toBe('connected');
     expect(result.current.isConnected).toBe(true);
+  });
+
+  it('does not open a socket when taskId is empty', () => {
+    renderHook(() => useTaskWebSocket({ taskId: '', onMessage: vi.fn() }));
+    expect(MockWebSocket.instance).toBeNull();
+  });
+
+  it('answers server pings without forwarding them to onMessage', () => {
+    const onMessage = vi.fn();
+    renderHook(() => useTaskWebSocket({ taskId: 'test-task', onMessage }));
+
+    act(() => MockWebSocket.instance!.simulateMessage({ type: 'ping' }));
+    expect(MockWebSocket.instance!.sent[0]).toBe(JSON.stringify({ type: 'pong' }));
+    expect(onMessage).not.toHaveBeenCalled();
+  });
+
+  it('ignores unparseable frames without crashing', () => {
+    const onMessage = vi.fn();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    renderHook(() => useTaskWebSocket({ taskId: 'test-task', onMessage }));
+
+    act(() => {
+      MockWebSocket.instance!.onmessage?.(
+        new MessageEvent('message', { data: 'not-json{{{' })
+      );
+    });
+    expect(onMessage).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('resumes from the persisted cursor via lastEventId', () => {
+    sessionStorage.setItem('ai-net:ws-cursor:cursor-task', '7');
+    renderHook(() => useTaskWebSocket({ taskId: 'cursor-task', onMessage: vi.fn() }));
+    expect(MockWebSocket.instance!.url).toContain('lastEventId=7');
+    sessionStorage.removeItem('ai-net:ws-cursor:cursor-task');
+  });
+
+  it('cleans up the socket on unmount without scheduling a reconnect', () => {
+    const setTimeoutSpy = vi.spyOn(global, 'setTimeout');
+    const { unmount } = renderHook(() =>
+      useTaskWebSocket({ taskId: 'test-task', onMessage: vi.fn() })
+    );
+    const callsBefore = setTimeoutSpy.mock.calls.length;
+    unmount();
+    // The close triggered by unmount must not schedule a reconnect.
+    expect(setTimeoutSpy.mock.calls.length).toBe(callsBefore);
+    setTimeoutSpy.mockRestore();
   });
 });

@@ -36,6 +36,7 @@ Before initiating an upgrade on Testnet:
 - [ ] Automated integration tests pass locally: `npm run test:upgrade`.
 - [ ] Current on-chain version and WASM hash are queried and recorded.
 - [ ] On-chain state backup snapshot is generated.
+- [ ] Storage migration dry-run report is reviewed and attached to the change.
 
 ```bash
 # Export environment variables
@@ -45,6 +46,18 @@ export UPGRADE_MANAGER_ID="C..."
 export CONTRACT_ID="C..."
 export ADMIN_ADDRESS="G..."
 ```
+
+Preview the storage change without writing state:
+
+```bash
+cd smart-contracts
+npm run migration:dry-run -- --current storage-layout.json --target migration-plan.json \
+  --output migration-summary.json
+```
+
+The report lists added, removed, and rewritten keys, the estimated ledger-entry
+delta, and irreversible steps. `--apply` is intentionally separate and writes
+the target layout only after the dry-run has been reviewed.
 
 ---
 
@@ -126,6 +139,7 @@ stellar contract invoke \
 Immediately following execution, run automated verification checks:
 
 ### 5.1 Verify Version & Hash
+
 ```bash
 stellar contract invoke \
   --network $NETWORK \
@@ -133,9 +147,11 @@ stellar contract invoke \
   --id $UPGRADE_MANAGER_ID \
   -- get_current_version
 ```
-*Expected Output:* `version: "2.0.0"`, `wasm_hash: <NEW_WASM_HASH>`.
+
+_Expected Output:_ `version: "2.0.0"`, `wasm_hash: <NEW_WASM_HASH>`.
 
 ### 5.2 Assert State Equivalence
+
 Query pre-existing testnet entities to verify 100% data fidelity:
 
 ```bash
@@ -163,6 +179,7 @@ stellar contract invoke \
 If data corruption, logic regressions, or unexpected transaction aborts occur post-upgrade:
 
 ### Step 6.1: Check Rollback Eligibility
+
 ```bash
 # Check if current ledger is within the 48h (34,560 ledger) rollback window
 stellar contract invoke \
@@ -171,11 +188,13 @@ stellar contract invoke \
   --id $UPGRADE_MANAGER_ID \
   -- can_rollback
 ```
-*If `true`, proceed immediately.*
+
+_If `true`, proceed immediately._
 
 ### Step 6.2: Execute Emergency Rollback
 
 #### Option A: Via Upgrade Manager (Recommended)
+
 ```bash
 stellar contract invoke \
   --network $NETWORK \
@@ -185,6 +204,7 @@ stellar contract invoke \
 ```
 
 #### Option B: Direct Contract Rollback (Fallback)
+
 ```bash
 stellar contract invoke \
   --network $NETWORK \
@@ -196,6 +216,7 @@ stellar contract invoke \
 ```
 
 ### Step 6.3: Post-Rollback Sanity Verification
+
 ```bash
 # Confirm version reverted to v1.0.0
 stellar contract invoke \

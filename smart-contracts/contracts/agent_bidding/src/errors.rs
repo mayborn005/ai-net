@@ -5,7 +5,7 @@
 //! callers can branch on the numeric code without coupling to a specific SDK
 //! build.
 //!
-//! The code range used here (`1..=33`) is local to this contract. Codes are
+//! The code range used here (`1..=36`) is local to this contract. Codes are
 //! chosen to read naturally in logs while remaining stable across releases:
 //! **never renumber an existing variant** once the contract is deployed.
 
@@ -73,16 +73,38 @@ pub enum Error {
     AuctionNotAbortable = 25,
     /// An arithmetic operation overflowed while scoring bids.
     ArithmeticOverflow = 26,
-    /// Contract instance has already been initialized.
+    /// Contract already initialized.
     AlreadyInitialized = 27,
-    /// Contract is currently paused.
+    /// The contract is currently paused.
     ContractPaused = 28,
-    /// Winner cannot claim refund via bond refund path.
+    /// The winning bidder cannot claim a refund on bond.
     WinnerCannotClaimRefund = 29,
-    /// Refund has already been claimed for this bidder.
+    /// The refund has already been claimed.
     RefundAlreadyClaimed = 30,
-    /// Claim window has expired.
+    /// The claim window for bond refund has expired.
     ClaimWindowExpired = 31,
-    /// Bond has already been refunded.
+    /// Bond already refunded.
     AlreadyRefunded = 32,
+    /// No payment asset (Stellar Asset Contract) has been configured.
+    AssetNotConfigured = 33,
+    /// The supplied asset or its decimals do not match the configured asset.
+    AssetMismatch = 34,
+    /// An amount is negative or not representable in the asset's decimals.
+    InvalidAmount = 35,
+    /// The escrow has already been released or refunded.
+    EscrowAlreadySettled = 36,
+    /// The auction already has the maximum number of bidders.
+    MaxBiddersReached = 37,
+    /// The requested audit range is invalid.
+    InvalidAuditRange = 38,
+    /// The referenced agent is not registered in the agent registry.
+    AgentNotFound = 39,
+    /// The referenced agent is frozen by the registry.
+    AgentFrozen = 40,
+    /// The registry rejected the agent for any other eligibility reason.
+    AgentNotEligible = 41,
+    /// The agent has been deregistered.
+    AgentDeregistered = 42,
+    /// The agent's bond is below the registry minimum.
+    InsufficientBond = 43,
 }

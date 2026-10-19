@@ -78,6 +78,40 @@ describe("API Documentation & Swagger UI", () => {
       expect(headers?.["X-RateLimit-Reset"]).toBeDefined();
       expect(headers?.["X-Request-Id"]).toBeDefined();
       expect(headers?.["X-API-Version"]).toBeDefined();
+      expect(headers?.["Retry-After"]).toBeDefined();
+    });
+
+    it("should define a reusable TooManyRequests response carrying Retry-After", () => {
+      const tooMany = openapiSpec.components?.responses?.TooManyRequests;
+      expect(tooMany).toBeDefined();
+      expect(Object.keys(tooMany.headers)).toEqual(
+        expect.arrayContaining(["Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"]),
+      );
+    });
+
+    it("should document rate-limit headers on every operation and Retry-After on every 429", () => {
+      const resolve = (r: any) =>
+        r?.$ref === "#/components/responses/TooManyRequests" ? openapiSpec.components.responses.TooManyRequests : r;
+      const missing: string[] = [];
+
+      for (const [path, item] of Object.entries<any>(openapiSpec.paths)) {
+        for (const method of ["get", "put", "post", "delete", "patch"]) {
+          const op = item[method];
+          if (!op) continue;
+          for (const [status, raw] of Object.entries<any>(op.responses)) {
+            if (raw.$ref && raw.$ref !== "#/components/responses/TooManyRequests") continue;
+            const headers = resolve(raw).headers ?? {};
+            const expected = ["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"];
+            if (status === "429") expected.push("Retry-After");
+            for (const h of expected) {
+              if (!headers[h]) missing.push(`${method.toUpperCase()} ${path} ${status} ${h}`);
+            }
+          }
+          if (!op.responses["429"]) missing.push(`${method.toUpperCase()} ${path} 429`);
+        }
+      }
+
+      expect(missing).toEqual([]);
     });
 
     it("should define core schemas with examples", () => {

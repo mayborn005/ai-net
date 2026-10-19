@@ -1723,6 +1723,61 @@ fn record_task_completion_success() {
 }
 
 #[test]
+fn authorized_task_outcome_updates_reputation_once_and_emits_event() {
+    let (env, client, admin) = setup_with_admin();
+    let reporter = Address::generate(&env);
+    let agent_id = Symbol::new(&env, "outcome_agent");
+    client.register_agent(&make_record(
+        &env,
+        "outcome_agent",
+        "coding",
+        Address::generate(&env),
+    ));
+    client.add_authorized_caller(&reporter);
+    let task_id = Symbol::new(&env, "task_once");
+    let previous_events = env.events().all().len();
+
+    client.record_task_outcome(&reporter, &agent_id, &true, &25_000i32, &task_id);
+    let rep = client.get_reputation(&agent_id).unwrap();
+    assert_eq!(rep.score, 25_000);
+    assert!(env.events().all().len() > previous_events);
+    client.record_task_outcome(
+        &reporter,
+        &agent_id,
+        &false,
+        &-10_000i32,
+        &Symbol::new(&env, "task_failure"),
+    );
+    assert_eq!(
+        client.get_reputation(&agent_id).unwrap().score,
+        rep.score - 10_000
+    );
+    assert!(client
+        .try_record_task_outcome(&reporter, &agent_id, &false, &-10_000i32, &task_id)
+        .is_err());
+    assert_eq!(client.get_reputation(&agent_id).unwrap().score, rep.score);
+    assert_eq!(client.is_authorized_caller(&reporter), true);
+    client.remove_authorized_caller(&reporter);
+    assert_eq!(client.is_authorized_caller(&reporter), false);
+    let _ = admin;
+}
+
+#[test]
+fn task_outcome_rejects_unlisted_reporter() {
+    let (env, client, _) = setup_with_admin();
+    let reporter = Address::generate(&env);
+    assert!(client
+        .try_record_task_outcome(
+            &reporter,
+            &Symbol::new(&env, "agent"),
+            &true,
+            &1i32,
+            &Symbol::new(&env, "task")
+        )
+        .is_err());
+}
+
+#[test]
 fn record_task_completion_failure() {
     let (env, client) = setup();
     let agent_id = Symbol::new(&env, "agent1");
@@ -2846,5 +2901,212 @@ fn reputation_paused_contract_blocks_updates() {
     assert_eq!(
         client.try_update_reputation(&admin, &agent, &full_reputation_input()),
         Err(Ok(Error::ContractPaused))
+    );
+}
+
+// ── Agent Capability Versioning tests (issue #243) ───────────────────────────
+
+fn register_versioned_agent(
+    env: &Env,
+    client: &AgentRegistryContractClient<'static>,
+    id: &str,
+) -> AgentRecord {
+    let owner = Address::generate(env);
+    let record = make_record(env, id, "research", owner);
+    client.register_agent(&record);
+    record
+}
+
+#[test]
+fn version_register_and_retrieve_single_version() {
+    let (env, client, _admin) = setup_with_admin();
+    let record = register_versioned_agent(&env, &client, "vagent1");
+
+    client.register_agent_version(&record, &String::from_str(&env, "1.0.0"));
+
+    let page = client.get_agent_versions(&record.id);
+    assert_eq!(page.versions.len(), 1);
+
+    let v = page.versions.get(0).unwrap();
+    assert_eq!(v.version.major, 1);
+    assert_eq!(v.version.minor, 0);
+    assert_eq!(v.version.patch, 0);
+    assert!(!v.superseded);
+}
+
+#[test]
+fn version_publish_new_version_supersedes_previous() {
+    let (env, client, _admin) = setup_with_admin();
+    let record = register_versioned_agent(&env, &client, "vagent2");
+
+    client.register_agent_version(&record, &String::from_str(&env, "1.0.0"));
+    client.register_agent_version(&record, &String::from_str(&env, "1.1.0"));
+
+    let page = client.get_agent_versions(&record.id);
+    assert_eq!(page.versions.len(), 2);
+
+    // Oldest version should be superseded.
+    let v0 = page.versions.get(0).unwrap();
+    assert_eq!(v0.version.major, 1);
+    assert_eq!(v0.version.minor, 0);
+    assert!(v0.superseded, "1.0.0 should be superseded");
+
+    // Latest version should not be superseded.
+    let v1 = page.versions.get(1).unwrap();
+    assert_eq!(v1.version.minor, 1);
+    assert!(!v1.superseded, "1.1.0 should not be superseded");
+}
+
+#[test]
+fn version_get_all_versions_ordered_oldest_first() {
+    let (env, client, _admin) = setup_with_admin();
+    let record = register_versioned_agent(&env, &client, "vagent3");
+
+    for ver in &["1.0.0", "1.1.0", "2.0.0"] {
+        client.register_agent_version(&record, &String::from_str(&env, ver));
+    }
+
+    let page = client.get_agent_versions(&record.id);
+    assert_eq!(page.versions.len(), 3);
+
+    assert_eq!(page.versions.get(0).unwrap().version.major, 1);
+    assert_eq!(page.versions.get(0).unwrap().version.minor, 0);
+    assert_eq!(page.versions.get(1).unwrap().version.minor, 1);
+    assert_eq!(page.versions.get(2).unwrap().version.major, 2);
+
+    // Only the last should be non-superseded.
+    assert!(page.versions.get(0).unwrap().superseded);
+    assert!(page.versions.get(1).unwrap().superseded);
+    assert!(!page.versions.get(2).unwrap().superseded);
+}
+
+#[test]
+fn version_rollback_rejected() {
+    let (env, client, _admin) = setup_with_admin();
+    let record = register_versioned_agent(&env, &client, "vagent4");
+
+    client.register_agent_version(&record, &String::from_str(&env, "2.0.0"));
+
+    // Trying to register a lower version should fail.
+    assert_eq!(
+        client.try_register_agent_version(&record, &String::from_str(&env, "1.9.9")),
+        Err(Ok(Error::AlreadyExists))
+    );
+    // Same version is also rejected.
+    assert_eq!(
+        client.try_register_agent_version(&record, &String::from_str(&env, "2.0.0")),
+        Err(Ok(Error::AlreadyExists))
+    );
+}
+
+#[test]
+fn version_invalid_semver_rejected() {
+    let (env, client, _admin) = setup_with_admin();
+    let record = register_versioned_agent(&env, &client, "vagent5");
+
+    for bad in &["1.0", "1.0.0.0", "abc", "1.x.0"] {
+        assert_eq!(
+            client.try_register_agent_version(&record, &String::from_str(&env, bad)),
+            Err(Ok(Error::InvalidVersion)),
+            "expected InvalidVersion for {:?}",
+            bad
+        );
+    }
+}
+
+#[test]
+fn version_unregistered_agent_returns_not_found() {
+    let (env, client, _admin) = setup_with_admin();
+    let owner = Address::generate(&env);
+    // Build a record without calling register_agent first.
+    let record = make_record(&env, "ghost", "research", owner);
+
+    assert_eq!(
+        client.try_register_agent_version(&record, &String::from_str(&env, "1.0.0")),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn version_no_versions_returns_error() {
+    let (env, client, _admin) = setup_with_admin();
+    let record = register_versioned_agent(&env, &client, "vagent6");
+
+    assert_eq!(
+        client.try_get_agent_versions(&record.id),
+        Err(Ok(Error::NoVersionsFound))
+    );
+}
+
+#[test]
+fn version_lookup_versioned_no_constraint_returns_all() {
+    let (env, client, _admin) = setup_with_admin();
+
+    let r1 = register_versioned_agent(&env, &client, "vlook1");
+    let r2 = register_versioned_agent(&env, &client, "vlook2");
+
+    client.register_agent_version(&r1, &String::from_str(&env, "1.0.0"));
+    client.register_agent_version(&r2, &String::from_str(&env, "2.0.0"));
+
+    let results = client.lookup_agents_versioned(&Symbol::new(&env, "research"), &None);
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
+fn version_lookup_versioned_constraint_filters_older_agents() {
+    let (env, client, _admin) = setup_with_admin();
+
+    let r1 = register_versioned_agent(&env, &client, "vflt1");
+    let r2 = register_versioned_agent(&env, &client, "vflt2");
+
+    // r1 is on v1.0.0, r2 is on v2.0.0.
+    client.register_agent_version(&r1, &String::from_str(&env, "1.0.0"));
+    client.register_agent_version(&r2, &String::from_str(&env, "2.0.0"));
+
+    // Ask for agents with version >= 2.0.0 — only r2 should match.
+    let constraint = Some(AgentVersion {
+        major: 2,
+        minor: 0,
+        patch: 0,
+    });
+    let results = client.lookup_agents_versioned(&Symbol::new(&env, "research"), &constraint);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap().id, r2.id);
+}
+
+#[test]
+fn version_events_emitted_on_publish_and_supersede() {
+    let (env, client, _admin) = setup_with_admin();
+    let record = register_versioned_agent(&env, &client, "vevt1");
+
+    client.register_agent_version(&record, &String::from_str(&env, "1.0.0"));
+    client.register_agent_version(&record, &String::from_str(&env, "1.1.0"));
+
+    // After two versions there must be at least one ver_pub and one ver_sup event.
+    let events = env.events().all();
+    let mut pub_count = 0u32;
+    let mut sup_count = 0u32;
+
+    for i in 0..events.len() {
+        let (_, topics, _) = events.get(i).unwrap();
+        if topics.len() < 2 {
+            continue;
+        }
+        let t1 = Symbol::from_val(&env, &topics.get(1).unwrap());
+        if t1 == Symbol::new(&env, "ver_pub") {
+            pub_count += 1;
+        }
+        if t1 == Symbol::new(&env, "ver_sup") {
+            sup_count += 1;
+        }
+    }
+
+    assert!(
+        pub_count >= 2,
+        "expected >=2 ver_pub events, got {pub_count}"
+    );
+    assert!(
+        sup_count >= 1,
+        "expected >=1 ver_sup event, got {sup_count}"
     );
 }
